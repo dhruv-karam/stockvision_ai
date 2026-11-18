@@ -225,6 +225,28 @@ def fetch_market_history_cached(
     end_text,
     credential_fingerprint,
 ):
+    
+@st.cache_data(
+    ttl=86400,
+    show_spinner=False,
+)
+def fetch_fundamentals_cached(
+    symbol,
+    market_price,
+    forecast_years=5,
+):
+    """
+    Automatically retrieve and calculate company fundamentals.
+
+    Cache for 24 hours to reduce external API requests.
+    """
+
+    return fetch_auto_fundamentals(
+        symbol=symbol,
+        market_price=market_price,
+        forecast_years=forecast_years,
+    )
+
     """
     Fetch historical prices using Kotak Neo.
 
@@ -1439,145 +1461,283 @@ with research_tab:
                 "of future losses."
             )
 
+
     # ==================================================
-    # FUNDAMENTAL ANALYSIS
+    # AUTOMATIC FUNDAMENTAL ANALYSIS
     # ==================================================
 
     with st.expander(
-        "🏢 Fundamental Analysis"
+        "🏢 Automatic Fundamental Analysis",
+        expanded=False,
     ):
 
         st.caption(
-            "Upload verified company financial statements "
-            "to calculate growth, profitability and leverage ratios."
+            "StockVision AI automatically retrieves financial statements "
+            "and calculates company fundamentals."
         )
 
-        financial_file = st.file_uploader(
-            "Annual Financial Statements CSV",
-            type=["csv"],
-            key="fundamentals_upload",
-        )
+        try:
 
-        st.caption(
-            "Required: fiscal_year, revenue, operating_profit, "
-            "net_profit, eps, total_equity, total_debt, "
-            "current_assets and current_liabilities."
-        )
+            with st.spinner(
+                f"Analysing {active_symbol} financial statements..."
+            ):
 
-        if st.button(
-            "Analyse Fundamentals"
-        ):
-
-            if financial_file is None:
-
-                st.warning(
-                    "Upload financial statements first."
+                fundamental_data = fetch_fundamentals_cached(
+                    symbol=active_symbol,
+                    market_price=latest_price,
+                    forecast_years=5,
                 )
 
-            else:
+            metrics = fundamental_data["metrics"]
+            assumptions = fundamental_data["assumptions"]
+            scenarios = fundamental_data["scenarios"]
 
-                try:
+            def display_value(value, suffix="%", digits=2):
 
-                    financials = pd.read_csv(
-                        financial_file
+                if value is None or pd.isna(value):
+                    return "N/A"
+
+                return f"{float(value):.{digits}f}{suffix}"
+
+            st.markdown(
+                f"### {fundamental_data['company']}"
+            )
+
+            st.caption(
+                f"{active_symbol} · "
+                f"Latest financial year: "
+                f"{fundamental_data['latest_fiscal_year']}"
+            )
+
+            st.divider()
+
+            # ------------------------------------------
+            # VALUATION METRICS
+            # ------------------------------------------
+
+            st.subheader("Company Valuation")
+
+            col1, col2, col3, col4 = st.columns(4)
+
+            col1.metric(
+                "Current EPS",
+                (
+                    f"₹{metrics['eps']:,.2f}"
+                    if pd.notna(metrics["eps"])
+                    else "N/A"
+                ),
+            )
+
+            col2.metric(
+                "Current P/E",
+                display_value(
+                    metrics["pe_ratio"],
+                    suffix="x",
+                ),
+            )
+
+            col3.metric(
+                "Revenue CAGR",
+                display_value(
+                    metrics["revenue_growth_pct"]
+                ),
+            )
+
+            col4.metric(
+                "EPS CAGR",
+                display_value(
+                    metrics["eps_growth_pct"]
+                ),
+            )
+
+            # ------------------------------------------
+            # PROFITABILITY
+            # ------------------------------------------
+
+            st.subheader("Profitability")
+
+            col1, col2, col3, col4 = st.columns(4)
+
+            col1.metric(
+                "ROE",
+                display_value(metrics["roe_pct"]),
+            )
+
+            col2.metric(
+                "ROCE",
+                display_value(metrics["roce_pct"]),
+            )
+
+            col3.metric(
+                "Operating Margin",
+                display_value(
+                    metrics["operating_margin_pct"]
+                ),
+            )
+
+            col4.metric(
+                "Net Profit Margin",
+                display_value(
+                    metrics["net_profit_margin_pct"]
+                ),
+            )
+
+            # ------------------------------------------
+            # FINANCIAL STRENGTH
+            # ------------------------------------------
+
+            st.subheader("Financial Strength")
+
+            col1, col2 = st.columns(2)
+
+            col1.metric(
+                "Debt / Equity",
+                display_value(
+                    metrics["debt_to_equity"],
+                    suffix="x",
+                ),
+            )
+
+            col2.metric(
+                "Current Ratio",
+                display_value(
+                    metrics["current_ratio"],
+                    suffix="x",
+                ),
+            )
+
+            # ------------------------------------------
+            # AUTOMATIC GROWTH ASSUMPTIONS
+            # ------------------------------------------
+
+            st.divider()
+
+            st.subheader("Five-Year Growth Assessment")
+
+            col1, col2, col3 = st.columns(3)
+
+            col1.metric(
+                "Bear Growth",
+                display_value(
+                    assumptions["bear_growth"]
+                ),
+            )
+
+            col2.metric(
+                "Base Growth",
+                display_value(
+                    assumptions["base_growth"]
+                ),
+            )
+
+            col3.metric(
+                "Bull Growth",
+                display_value(
+                    assumptions["bull_growth"]
+                ),
+            )
+
+            st.caption(
+                "Growth assumptions are derived from historical "
+                f"financial performance. Method: "
+                f"{assumptions['growth_method']}."
+            )
+
+            # ------------------------------------------
+            # AUTOMATIC VALUATION SCENARIOS
+            # ------------------------------------------
+
+            st.subheader("Estimated Five-Year Share Price")
+
+            scenario_columns = st.columns(3)
+
+            scenario_details = [
+                ("Bear", "🐻"),
+                ("Base", "⚖️"),
+                ("Bull", "🚀"),
+            ]
+
+            for column, (scenario_name, emoji) in zip(
+                scenario_columns,
+                scenario_details,
+            ):
+
+                row = scenarios[
+                    scenarios["scenario"] == scenario_name
+                ]
+
+                if row.empty:
+                    continue
+
+                result = row.iloc[0]
+
+                with column:
+
+                    st.markdown(
+                        f"#### {emoji} {scenario_name}"
                     )
 
-                    fundamental_results = (
-                        analyze_fundamentals(
-                            financials,
-                            market_price=latest_price,
+                    st.metric(
+                        "Estimated Future Price",
+                        f"₹{result['estimated_future_price']:,.2f}",
+                        (
+                            f"{result['total_price_return_pct']:+.2f}%"
+                        ),
+                    )
+
+                    st.caption(
+                        "Annualized return: "
+                        + display_value(
+                            result["annualized_price_return_pct"]
                         )
                     )
 
-                    st.session_state["fundamental_results"] = (
-                        fundamental_results
-                    )
-
-                    st.session_state["fundamental_symbol"] = (
-                        active_symbol
-                    )
-
-                except Exception as exc:
-
-                    st.error(
-                        f"Fundamental analysis failed: {exc}"
-                    )
-
-        fundamentals = st.session_state["fundamental_results"]
-
-        if (
-            fundamentals is not None
-            and st.session_state["fundamental_symbol"] == active_symbol
-        ):
-
-            st.subheader("Financial Health")
-
-            a, b, c, d = st.columns(4)
-
-            a.metric(
-                "EPS",
-                f"₹{fundamentals['eps']:,.2f}",
+            st.caption(
+                "Future P/E assumptions are automatically derived "
+                "from the current P/E with scenario adjustments. "
+                "These are estimates, not guaranteed targets."
             )
 
-            b.metric(
-                "P/E",
-                (
-                    f"{fundamentals['pe_ratio']:.2f}"
-                    if pd.notna(fundamentals["pe_ratio"])
-                    else "N/A"
-                ),
-            )
+            # ------------------------------------------
+            # FINANCIAL HISTORY
+            # ------------------------------------------
 
-            c.metric(
-                "ROE",
-                (
-                    f"{fundamentals['roe_pct']:.2f}%"
-                    if pd.notna(fundamentals["roe_pct"])
-                    else "N/A"
-                ),
-            )
+            history = fundamental_data["financial_history"]
 
-            d.metric(
-                "Debt / Equity",
-                (
-                    f"{fundamentals['debt_to_equity']:.2f}"
-                    if pd.notna(fundamentals["debt_to_equity"])
-                    else "N/A"
-                ),
-            )
+            if history is not None and not history.empty:
 
-            st.subheader("Growth and Profitability")
+                st.divider()
 
-            display_metrics = {
-                "Revenue Growth": fundamentals["revenue_growth_pct"],
-                "Operating Profit Growth": fundamentals["operating_profit_growth_pct"],
-                "Net Profit Growth": fundamentals["net_profit_growth_pct"],
-                "EPS Growth": fundamentals["eps_growth_pct"],
-                "Operating Margin": fundamentals["operating_margin_pct"],
-                "Net Profit Margin": fundamentals["net_profit_margin_pct"],
-                "ROCE": fundamentals["roce_pct"],
-                "Current Ratio": fundamentals["current_ratio"],
-            }
+                with st.expander(
+                    "View reported annual financial history"
+                ):
 
-            for label, value in display_metrics.items():
-
-                if pd.notna(value):
-
-                    formatted = (
-                        f"{value:.2f}%"
-                        if "Growth" in label or "Margin" in label or label == "ROCE"
-                        else f"{value:.2f}"
+                    st.dataframe(
+                        history,
+                        use_container_width=True,
+                        hide_index=True,
                     )
 
-                    st.write(
-                        f"**{label}:** {formatted}"
-                    )
+            st.caption(
+                f"Data source: {fundamental_data['source']} · "
+                f"Updated: {fundamental_data['updated_at']}"
+            )
 
-                else:
+        except Exception as exc:
 
-                    st.write(
-                        f"**{label}:** N/A"
-                    )
+            st.warning(
+                "Automatic fundamental analysis is currently "
+                "unavailable for this stock."
+            )
+
+            st.caption(
+                f"Data source response: {exc}"
+            )
+
+            st.caption(
+                "No financial assumptions have been fabricated. "
+                "Try again later or verify the company financial statements."
+            )
 
 
 # ==================================================
