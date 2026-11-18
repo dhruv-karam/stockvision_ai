@@ -54,7 +54,7 @@ from stockvision.scanner import (
 )
 
 from stockvision.fundamentals import (
-    analyze_fundamentals,
+    fetch_auto_fundamentals,
 )
 
 
