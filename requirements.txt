@@ -1,3 +1,4 @@
+
 streamlit
 kotakneoapi
 pandas
@@ -8,3 +9,4 @@ plotly
 python-dotenv
 requests
 joblib
+yfinance
