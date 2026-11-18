@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 from datetime import date, timedelta
+from stockvision.signals import generate_technical_signal
 from pathlib import Path
 from stockvision.instruments import update_instruments
 from stockvision.backtesting import walk_forward_backtest
@@ -390,6 +391,53 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
 # --------------------------------------------------
 
 with tab1:
+        # Technical Signal Summary
+
+    st.subheader("🎯 Overall Technical Signal")
+
+    try:
+        signal = generate_technical_signal(price_df)
+
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            st.metric(
+                "Technical Bias",
+                signal["overall_signal"],
+            )
+
+        with col2:
+            st.metric(
+                "Technical Score",
+                f"{signal['score']:+.1f} / 100",
+            )
+
+        with col3:
+            st.metric(
+                "RSI Status",
+                signal["rsi_status"],
+            )
+
+        st.markdown("#### Individual Indicator Signals")
+
+        st.dataframe(
+            signal["indicators"],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.caption(
+            "Positive scores indicate bullish technical conditions; "
+            "negative scores indicate bearish conditions. "
+            "This is not a buy or sell recommendation."
+        )
+
+    except ValueError as error:
+        st.info(
+            f"Technical signal is not available yet: {error}"
+        )
+
+    st.divider()
 
     st.subheader("Historical Closing Price")
 
