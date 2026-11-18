@@ -4,6 +4,7 @@ import plotly.express as px
 from datetime import date, timedelta
 from pathlib import Path
 from stockvision.instruments import update_instruments
+from stockvision.backtesting import walk_forward_backtest
 
 from stockvision.data import fetch_daily_history
 from stockvision.features import build_features
