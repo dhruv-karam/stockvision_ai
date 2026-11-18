@@ -1,3 +1,4 @@
+
 from datetime import datetime
 from pathlib import Path
 
@@ -13,12 +14,20 @@ from sklearn.metrics import (
 from xgboost import XGBRegressor
 
 
+# --------------------------------------------------
+# PROJECT CONFIGURATION
+# --------------------------------------------------
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MODEL_DIR = PROJECT_ROOT / "models"
 
 FORECAST_HORIZONS = [21, 63, 126, 252]
 
-# Use features that are less dependent on a stock's absolute price.
+
+# --------------------------------------------------
+# MODEL FEATURES
+# --------------------------------------------------
+
 FEATURE_COLUMNS = [
     "daily_return",
     "log_return",
@@ -41,84 +50,114 @@ FEATURE_COLUMNS = [
     "macd_histogram_percent",
 ]
 
+MACD_SOURCE_COLUMNS = [
+    "macd",
+    "macd_signal",
+    "macd_histogram",
+]
+
+
+# --------------------------------------------------
+# PREPARE MODEL DATA
+# --------------------------------------------------
 
 def prepare_model_data(feature_df):
     """
-    Prepare features and future log-return targets.
+    Prepare technical features and future log-return targets.
 
-    The target for each horizon is:
-
+    Target:
         log(future closing price / current closing price)
 
     This avoids training directly on absolute stock-price changes.
     """
 
-    required_columns = {"date", "close"}
+    if not isinstance(feature_df, pd.DataFrame):
+        raise TypeError(
+            "feature_df must be a pandas DataFrame."
+        )
+
+    required_columns = {
+        "date",
+        "close",
+        *MACD_SOURCE_COLUMNS,
+        *[c for c in FEATURE_COLUMNS if c not in {
+            "macd_percent",
+            "macd_signal_percent",
+            "macd_histogram_percent",
+        }],
+    }
 
     missing = required_columns - set(feature_df.columns)
 
     if missing:
         raise ValueError(
-            "Missing required columns: "
-            + ", ".join(sorted(missing))
+            "Missing model columns. Run build_features() first. "
+            "Missing: " + ", ".join(sorted(missing))
         )
 
     df = feature_df.copy()
 
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    df["date"] = pd.to_datetime(
+        df["date"],
+        errors="coerce"
+    )
+
+    numeric_columns = list(
+        set(FEATURE_COLUMNS + MACD_SOURCE_COLUMNS + ["close"])
+    )
+
+    for column in numeric_columns:
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce"
+        )
 
     df = (
         df.dropna(subset=["date", "close"])
         .sort_values("date")
-        .drop_duplicates(subset="date", keep="last")
+        .drop_duplicates(
+            subset="date",
+            keep="last"
+        )
         .reset_index(drop=True)
     )
 
     if df.empty:
-        raise ValueError("No valid price data is available.")
+        raise ValueError(
+            "No valid price data is available."
+        )
 
     if (df["close"] <= 0).any():
-        raise ValueError("Closing prices must be positive.")
+        raise ValueError(
+            "Closing prices must be positive."
+        )
 
-    # Keep the original row position for time-series validation.
-    df["_position"] = np.arange(len(df))
-
-    # Add percentage-scaled MACD features.
+    # Percentage-scaled MACD features.
     df["macd_percent"] = df["macd"] / df["close"]
+
     df["macd_signal_percent"] = (
         df["macd_signal"] / df["close"]
     )
+
     df["macd_histogram_percent"] = (
         df["macd_histogram"] / df["close"]
     )
 
-    available_features = [
-        column
-        for column in FEATURE_COLUMNS
-        if column in df.columns
-    ]
-
-    missing_features = [
-        column
-        for column in FEATURE_COLUMNS
-        if column not in df.columns
-    ]
-
-    if missing_features:
-        raise ValueError(
-            "Missing model features. Run build_features() first. "
-            "Missing: " + ", ".join(missing_features)
-        )
-
-    # Replace invalid numerical values.
-    df[available_features] = (
-        df[available_features]
+    # Replace infinite values with missing values.
+    df[FEATURE_COLUMNS] = (
+        df[FEATURE_COLUMNS]
         .replace([np.inf, -np.inf], np.nan)
     )
 
-    return df, available_features
+    # Preserve chronological row positions.
+    df["_position"] = np.arange(len(df))
 
+    return df, FEATURE_COLUMNS.copy()
+
+
+# --------------------------------------------------
+# CREATE XGBOOST MODEL
+# --------------------------------------------------
 
 def create_model():
     """Create an XGBoost regression model."""
@@ -137,6 +176,10 @@ def create_model():
     )
 
 
+# --------------------------------------------------
+# TRAIN ONE FORECAST HORIZON
+# --------------------------------------------------
+
 def train_one_horizon(
     df,
     feature_columns,
@@ -147,15 +190,33 @@ def train_one_horizon(
     """
     Train and evaluate one forecasting horizon.
 
-    Validation is chronological, not randomly shuffled.
+    Uses chronological holdout validation.
 
-    Training rows whose future target would overlap the test
-    period are excluded from the training set.
+    Training samples whose future target overlaps
+    the validation period are excluded.
+
+    A separate final model is fitted on all labelled
+    observations for the latest forecast.
     """
 
-    target_column = f"target_{horizon}d"
+    horizon = int(horizon)
 
-    working = df.copy()
+    if horizon <= 0:
+        raise ValueError(
+            "Forecast horizon must be positive."
+        )
+
+    if not 0 < test_size < 0.5:
+        raise ValueError(
+            "test_size must be greater than 0 and less than 0.5."
+        )
+
+    working = df.copy().reset_index(drop=True)
+
+    if "_position" not in working.columns:
+        working["_position"] = np.arange(len(working))
+
+    target_column = f"target_{horizon}d"
 
     # Future log return over the requested horizon.
     working[target_column] = np.log(
@@ -163,52 +224,62 @@ def train_one_horizon(
         / working["close"]
     )
 
- total_rows = len(working)
+    total_rows = len(working)
 
-if total_rows < 150:
-    raise ValueError(
-        f"Not enough historical data for the {horizon}-day model. "
-        "Collect more daily price history."
+    if total_rows < 150:
+        raise ValueError(
+            f"Not enough historical data for the {horizon}-day model. "
+            "Collect more daily price history."
+        )
+
+    if horizon >= total_rows:
+        raise ValueError(
+            f"Not enough observations for a {horizon}-day forecast."
+        )
+
+    # --------------------------------------------------
+    # CHRONOLOGICAL VALIDATION SPLIT
+    # --------------------------------------------------
+
+    # Reserve rows for the validation period.
+    # Also reserve the future horizon needed to calculate
+    # actual validation targets.
+    validation_rows = max(
+        20,
+        int(total_rows * test_size)
     )
 
-if not 0 < test_size < 0.5:
-    raise ValueError(
-        "test_size must be greater than 0 and less than 0.5."
+    maximum_validation_rows = (
+        total_rows - horizon - 1
     )
 
-if horizon >= total_rows:
-    raise ValueError(
-        f"Not enough observations for a {horizon}-day forecast."
+    if maximum_validation_rows < 20:
+        raise ValueError(
+            f"Insufficient historical data for the {horizon}-day model. "
+            "Collect more daily price history."
+        )
+
+    validation_rows = min(
+        validation_rows,
+        maximum_validation_rows
     )
 
-# Reserve enough observations for both:
-# 1. The future forecast horizon.
-# 2. A chronological validation sample.
-validation_rows = max(
-    20,
-    int(total_rows * test_size)
-)
+    if validation_rows < 20:
+        raise ValueError(
+            f"Insufficient validation observations "
+            f"for the {horizon}-day model."
+        )
 
-maximum_validation_rows = total_rows - horizon - 1
-
-validation_rows = min(
-    validation_rows,
-    maximum_validation_rows
-)
-
-if validation_rows < 20:
-    raise ValueError(
-        f"Insufficient historical data for {horizon}-day validation. "
-        "Collect more daily price history."
+    # Move the training boundary earlier to account for
+    # the future target period.
+    split_position = (
+        total_rows - horizon - validation_rows
     )
 
-# Move the training boundary earlier to account for
-# the future target period.
-split_position = (
-    total_rows - horizon - validation_rows
-)
+    # --------------------------------------------------
+    # PURGE OVERLAPPING TRAINING TARGETS
+    # --------------------------------------------------
 
-    # Purge training examples whose target reaches into the test period.
     train_mask = (
         (working["_position"] + horizon <= split_position)
         & working[target_column].notna()
@@ -216,10 +287,10 @@ split_position = (
 
     test_mask = (
         (working["_position"] >= split_position)
+        & (working["_position"] < split_position + validation_rows)
         & working[target_column].notna()
     )
 
-    # Keep only rows with complete model features.
     train_data = working.loc[train_mask].dropna(
         subset=feature_columns
     )
@@ -231,7 +302,8 @@ split_position = (
     if len(train_data) < 100:
         raise ValueError(
             f"Insufficient training data for the {horizon}-day model. "
-            f"Available training rows: {len(train_data)}."
+            f"Available training rows: {len(train_data)}. "
+            "Collect more historical data."
         )
 
     if len(test_data) < 20:
@@ -240,33 +312,53 @@ split_position = (
             f"Available test rows: {len(test_data)}."
         )
 
+    # --------------------------------------------------
+    # VALIDATION TRAINING
+    # --------------------------------------------------
+
     X_train = train_data[feature_columns]
     y_train = train_data[target_column]
 
     X_test = test_data[feature_columns]
     y_test = test_data[target_column]
 
-    # Train a model for out-of-sample evaluation.
     validation_model = create_model()
-    validation_model.fit(X_train, y_train)
+
+    validation_model.fit(
+        X_train,
+        y_train
+    )
 
     predictions = validation_model.predict(X_test)
 
-    mae = mean_absolute_error(y_test, predictions)
+    mae = mean_absolute_error(
+        y_test,
+        predictions
+    )
 
     rmse = np.sqrt(
         mean_squared_error(y_test, predictions)
     )
 
-    # Directional accuracy: did the model predict the right sign?
-    actual_direction = np.sign(y_test.to_numpy())
-    predicted_direction = np.sign(predictions)
+    # Directional accuracy.
+    actual_direction = np.sign(
+        y_test.to_numpy()
+    )
+
+    predicted_direction = np.sign(
+        predictions
+    )
 
     directional_accuracy = np.mean(
         actual_direction == predicted_direction
     )
 
-    # Refit on all available labelled observations for forecasting.
+    # --------------------------------------------------
+    # FINAL MODEL TRAINING
+    # --------------------------------------------------
+
+    # Include every observation whose future target
+    # is already known in the current historical dataset.
     labelled_data = working.dropna(
         subset=feature_columns + [target_column]
     )
@@ -278,20 +370,32 @@ split_position = (
         labelled_data[target_column]
     )
 
-    # Save the model and its metadata.
-    model_dir = Path(model_dir)
-    model_dir.mkdir(parents=True, exist_ok=True)
+    # --------------------------------------------------
+    # SAVE TRAINED MODEL
+    # --------------------------------------------------
 
-    model_path = model_dir / f"xgboost_{horizon}d.joblib"
+    model_dir = Path(model_dir)
+
+    model_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    model_path = (
+        model_dir / f"xgboost_{horizon}d.joblib"
+    )
 
     model_bundle = {
         "model": final_model,
         "horizon": horizon,
         "feature_columns": feature_columns,
-        "trained_at": datetime.now().isoformat(),
+        "trained_at": datetime.now().astimezone().isoformat(),
     }
 
-    joblib.dump(model_bundle, model_path)
+    joblib.dump(
+        model_bundle,
+        model_path
+    )
 
     return {
         "model": final_model,
@@ -300,11 +404,17 @@ split_position = (
         "model_path": str(model_path),
         "mae": float(mae),
         "rmse": float(rmse),
-        "directional_accuracy": float(directional_accuracy),
+        "directional_accuracy": float(
+            directional_accuracy
+        ),
         "training_rows": len(labelled_data),
         "validation_rows": len(test_data),
     }
 
+
+# --------------------------------------------------
+# TRAIN ALL FORECAST MODELS
+# --------------------------------------------------
 
 def train_forecast_models(
     feature_df,
@@ -313,22 +423,35 @@ def train_forecast_models(
     model_dir=MODEL_DIR,
 ):
     """
-    Train one XGBoost model for every requested horizon.
+    Train separate XGBoost models for each horizon.
 
-    Returns a dictionary containing models and evaluation metrics.
+    Default horizons:
+        21 trading days
+        63 trading days
+        126 trading days
+        252 trading days
+
+    Returns a dictionary of trained models and metrics.
     """
 
-    df, feature_columns = prepare_model_data(feature_df)
+    df, feature_columns = prepare_model_data(
+        feature_df
+    )
 
     trained_models = {}
 
     for horizon in horizons:
+
         horizon = int(horizon)
 
         if horizon <= 0:
-            raise ValueError("Forecast horizons must be positive.")
+            raise ValueError(
+                "Forecast horizons must be positive."
+            )
 
-        print(f"Training {horizon}-trading-day model...")
+        print(
+            f"Training {horizon}-trading-day model..."
+        )
 
         result = train_one_horizon(
             df=df,
@@ -351,36 +474,75 @@ def train_forecast_models(
     return trained_models
 
 
-def predict_latest(feature_df, trained_models):
-    """
-    Generate forecasts using the latest available feature row.
+# --------------------------------------------------
+# GENERATE LATEST FORECASTS
+# --------------------------------------------------
 
-    Returns predicted percentage returns and estimated prices.
+def predict_latest(
+    feature_df,
+    trained_models,
+):
     """
+    Generate estimated future prices using the latest
+    available technical feature row.
+
+    Returns a DataFrame containing:
+        horizon_days
+        current_price
+        predicted_return_pct
+        predicted_price
+    """
+
+    if not trained_models:
+        raise ValueError(
+            "No trained forecasting models were supplied."
+        )
 
     df, _ = prepare_model_data(feature_df)
 
     latest = df.iloc[[-1]]
-    current_price = float(latest["close"].iloc[0])
+
+    current_price = float(
+        latest["close"].iloc[0]
+    )
 
     forecasts = []
 
     for horizon, bundle in trained_models.items():
 
         model = bundle["model"]
+
         feature_columns = bundle["feature_columns"]
+
+        missing = [
+            column
+            for column in feature_columns
+            if column not in latest.columns
+        ]
+
+        if missing:
+            raise ValueError(
+                "Forecast features are missing: "
+                + ", ".join(missing)
+            )
 
         X_latest = latest[feature_columns]
 
         if X_latest.isna().any().any():
             raise ValueError(
-                "The latest row has missing model features. "
+                "Latest row contains missing model features. "
                 "Collect more historical data."
             )
 
         predicted_log_return = float(
             model.predict(X_latest)[0]
         )
+
+        if not np.isfinite(predicted_log_return):
+            raise ValueError(
+                f"Model returned an invalid prediction "
+                f"for the {horizon}-day horizon."
+            )
 
         predicted_return = (
             np.exp(predicted_log_return) - 1
@@ -390,10 +552,18 @@ def predict_latest(feature_df, trained_models):
             current_price * np.exp(predicted_log_return)
         )
 
+        if not np.isfinite(predicted_price):
+            raise ValueError(
+                f"Predicted price is outside the valid numerical "
+                f"range for the {horizon}-day horizon."
+            )
+
         forecasts.append({
             "horizon_days": int(horizon),
             "current_price": current_price,
-            "predicted_return_pct": predicted_return * 100,
+            "predicted_return_pct": (
+                predicted_return * 100
+            ),
             "predicted_price": float(predicted_price),
         })
 
@@ -404,11 +574,20 @@ def predict_latest(feature_df, trained_models):
     )
 
 
-def load_saved_model(horizon, model_dir=MODEL_DIR):
-    """Load a previously saved forecasting model."""
+# --------------------------------------------------
+# LOAD SAVED MODEL
+# --------------------------------------------------
+
+def load_saved_model(
+    horizon,
+    model_dir=MODEL_DIR,
+):
+    """Load a previously saved forecasting model bundle."""
+
+    horizon = int(horizon)
 
     model_path = (
-        Path(model_dir) / f"xgboost_{int(horizon)}d.joblib"
+        Path(model_dir) / f"xgboost_{horizon}d.joblib"
     )
 
     if not model_path.exists():
@@ -416,4 +595,12 @@ def load_saved_model(horizon, model_dir=MODEL_DIR):
             f"No saved model found at {model_path}"
         )
 
-    return joblib.load(model_path)
+    bundle = joblib.load(model_path)
+
+    if not isinstance(bundle, dict) or "model" not in bundle:
+        raise ValueError(
+            "Saved model file has an unexpected format. "
+            "Retrain the model."
+        )
+
+    return bundle
