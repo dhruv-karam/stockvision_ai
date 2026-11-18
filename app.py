@@ -217,7 +217,7 @@ periods = {
 period_label = st.sidebar.selectbox(
     "Historical range",
     list(periods),
-    index=2,
+    index=0,
 )
 
 period_days = periods[period_label]
