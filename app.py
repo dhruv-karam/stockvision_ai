@@ -186,8 +186,17 @@ if fetch_button:
                 else:
                     st.session_state.price_data = price_df
                     st.session_state.active_symbol = symbol
+
+                    # Clear old analysis results    
                     st.session_state.trained_models = None
                     st.session_state.forecasts = None
+                    st.session_state.valuation_results = None
+                    st.session_state.risk_results = None
+                    st.session_state.backtest_summary = None
+                    st.session_state.backtest_predictions = None
+                    st.session_state.fundamental_results = None
+                    st.session_state.fundamental_symbol = None
+                    st.session_state.scanner_results = None
 
                     st.success(
                         f"Successfully fetched {len(price_df)} "
