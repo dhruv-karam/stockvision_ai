@@ -14,6 +14,11 @@ from stockvision.modeling import (
     FORECAST_HORIZONS,
 )
 from stockvision.valuation import calculate_long_term_scenarios
+from stockvision.watchlist import (
+    load_watchlist,
+    add_symbol,
+    remove_symbol,
+)
 
 
 # --------------------------------------------------
@@ -370,17 +375,16 @@ st.divider()
 # --------------------------------------------------
 # DASHBOARD TABS
 # --------------------------------------------------
-
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
     [
         "📈 Market Analysis",
         "🤖 AI Forecasts",
         "💰 Long-Term Valuation",
         "📋 Historical Data",
         "🧪 Backtesting",
+        "⭐ Watchlist",
     ]
 )
-
 # --------------------------------------------------
 # TAB 1: MARKET ANALYSIS
 # --------------------------------------------------
@@ -1011,6 +1015,103 @@ with tab5:
         st.info(
             "Run a backtest to see historical model performance."
         )
+# --------------------------------------------------
+# TAB 6: STOCK WATCHLIST
+# --------------------------------------------------
+
+with tab6:
+
+    st.subheader("⭐ My NSE Stock Watchlist")
+
+    st.write(
+        "Maintain a personal list of NSE stocks you want "
+        "to research and monitor."
+    )
+
+    # Add a stock
+    with st.form("add_watchlist_form"):
+
+        new_symbol = st.text_input(
+            "Enter NSE stock symbol",
+            placeholder="Example: TCS",
+        )
+
+        add_button = st.form_submit_button(
+            "➕ Add Stock",
+            use_container_width=True,
+        )
+
+    if add_button:
+
+        try:
+            result = add_symbol(new_symbol)
+
+            if result["success"]:
+                st.success(result["message"])
+            else:
+                st.warning(result["message"])
+
+        except ValueError as error:
+            st.error(str(error))
+
+        except Exception as error:
+            st.error(f"Unable to update watchlist: {error}")
+
+    st.divider()
+
+    # Display saved stocks
+    watchlist_df = load_watchlist()
+
+    st.subheader("Saved Stocks")
+
+    if watchlist_df.empty:
+
+        st.info(
+            "Your watchlist is empty. Add your first stock above."
+        )
+
+    else:
+
+        st.metric(
+            "Stocks in Watchlist",
+            len(watchlist_df),
+        )
+
+        st.dataframe(
+            watchlist_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        # Remove a stock
+        selected_symbol = st.selectbox(
+            "Select a stock to remove",
+            options=watchlist_df["symbol"].tolist(),
+        )
+
+        if st.button(
+            "🗑️ Remove Selected Stock",
+            use_container_width=True,
+        ):
+
+            try:
+                result = remove_symbol(selected_symbol)
+
+                if result["success"]:
+                    st.success(result["message"])
+                    st.rerun()
+                else:
+                    st.warning(result["message"])
+
+            except Exception as error:
+                st.error(
+                    f"Unable to remove stock: {error}"
+                )
+
+    st.caption(
+        "Your watchlist is saved locally in data/watchlist.csv. "
+        "It is not automatically synchronized across devices."
+    )
 # --------------------------------------------------
 # FOOTER
 # --------------------------------------------------
