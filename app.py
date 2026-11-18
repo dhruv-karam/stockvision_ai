@@ -1,33 +1,66 @@
 
 import hashlib
 import os
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import date, timedelta
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from stockvision.data import create_neo_client, fetch_daily_history
+
+# ==================================================
+# IMPORT PROJECT MODULES
+# ==================================================
+
+from stockvision.data import (
+    create_neo_client,
+    fetch_daily_history,
+)
+
 from stockvision.features import build_features
+
 from stockvision.instruments import update_instruments
+
 from stockvision.modeling import (
     FORECAST_HORIZONS,
     train_forecast_models,
     predict_latest,
 )
-from stockvision.valuation import calculate_long_term_scenarios
-from stockvision.signals import generate_technical_signal
-from stockvision.risk import calculate_risk_metrics
-from stockvision.backtesting import walk_forward_backtest
-from stockvision.watchlist import load_watchlist, add_symbol, remove_symbol
-from stockvision.scanner import scan_watchlist
-from stockvision.fundamentals import analyze_fundamentals
+
+from stockvision.valuation import (
+    calculate_long_term_scenarios,
+)
+
+from stockvision.signals import (
+    generate_technical_signal,
+)
+
+from stockvision.risk import (
+    calculate_risk_metrics,
+)
+
+from stockvision.backtesting import (
+    walk_forward_backtest,
+)
+
+from stockvision.watchlist import (
+    load_watchlist,
+    add_symbol,
+    remove_symbol,
+)
+
+from stockvision.scanner import (
+    scan_watchlist,
+)
+
+from stockvision.fundamentals import (
+    analyze_fundamentals,
+)
 
 
-# --------------------------------------------------
+# ==================================================
 # PAGE CONFIGURATION
-# --------------------------------------------------
+# ==================================================
 
 st.set_page_config(
     page_title="StockVision AI",
@@ -35,113 +68,157 @@ st.set_page_config(
     layout="wide",
 )
 
+
+# ==================================================
+# CUSTOM DESIGN
+# ==================================================
+
 st.markdown(
     """
     <style>
+
     .block-container {
         max-width: 1440px;
         padding-top: 1.5rem;
-        padding-bottom: 2.5rem;
+        padding-bottom: 2rem;
     }
 
     div[data-testid="stMetric"] {
         background: rgba(125, 135, 150, 0.08);
         border: 1px solid rgba(150, 150, 150, 0.18);
-        padding: 12px 15px;
         border-radius: 12px;
-    }
-
-    div[data-testid="stTabs"] button {
-        padding: .6rem .9rem;
-        font-weight: 600;
+        padding: 13px;
     }
 
     h1 {
-        letter-spacing: -.03em;
+        letter-spacing: -0.03em;
     }
+
+    div[data-testid="stTabs"] button {
+        font-weight: 600;
+        padding: 0.65rem 1rem;
+    }
+
+    div[data-testid="stExpander"] {
+        border-radius: 10px;
+    }
+
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 
-# --------------------------------------------------
+# ==================================================
 # STREAMLIT CLOUD SECRETS
-# --------------------------------------------------
+# ==================================================
 
 def apply_streamlit_secrets():
-    """Make Streamlit Cloud secrets available to the Kotak client."""
+    """Load Kotak credentials from Streamlit Cloud Secrets."""
 
     try:
-        key = st.secrets.get("NEO_CONSUMER_KEY", "")
-        environment = st.secrets.get("NEO_ENVIRONMENT", "prod")
-    except Exception:
-        key, environment = "", "prod"
+        consumer_key = st.secrets.get(
+            "NEO_CONSUMER_KEY",
+            ""
+        )
 
-    if key:
-        os.environ["NEO_CONSUMER_KEY"] = str(key).strip()
+        environment = st.secrets.get(
+            "NEO_ENVIRONMENT",
+            "prod"
+        )
+
+    except Exception:
+        consumer_key = ""
+        environment = "prod"
+
+    if consumer_key:
+        os.environ["NEO_CONSUMER_KEY"] = str(
+            consumer_key
+        ).strip()
 
     if environment:
-        os.environ["NEO_ENVIRONMENT"] = str(environment).strip()
+        os.environ["NEO_ENVIRONMENT"] = str(
+            environment
+        ).strip()
 
 
 apply_streamlit_secrets()
 
-consumer_key = os.getenv("NEO_CONSUMER_KEY", "").strip()
+consumer_key = os.getenv(
+    "NEO_CONSUMER_KEY",
+    ""
+).strip()
 
 has_kotak_key = bool(
-    consumer_key and not consumer_key.startswith("YOUR_")
+    consumer_key
+    and not consumer_key.startswith("YOUR_")
 )
 
 
-# --------------------------------------------------
+# ==================================================
 # SESSION STATE
-# --------------------------------------------------
+# ==================================================
 
-DEFAULTS = {
+DEFAULT_STATE = {
     "price_data": None,
     "active_symbol": None,
     "data_source": None,
     "data_error": None,
     "auto_fetch_signature": None,
+
     "trained_models": None,
     "forecasts": None,
+
     "backtest_summary": None,
     "backtest_predictions": None,
+
     "valuation_results": None,
+    "valuation_symbol": None,
+    "valuation_years": None,
+
     "risk_results": None,
+
     "fundamental_results": None,
     "fundamental_symbol": None,
+
     "scanner_results": None,
 }
 
-for key, value in DEFAULTS.items():
+for key, value in DEFAULT_STATE.items():
+
     if key not in st.session_state:
         st.session_state[key] = value
 
 
 def clear_analysis_results():
-    """Clear calculations tied to an older price dataset."""
+    """Clear results belonging to an old dataset."""
 
-    for key in (
+    keys = [
         "trained_models",
         "forecasts",
         "backtest_summary",
         "backtest_predictions",
         "valuation_results",
+        "valuation_symbol",
+        "valuation_years",
         "risk_results",
         "fundamental_results",
         "fundamental_symbol",
         "scanner_results",
-    ):
+    ]
+
+    for key in keys:
         st.session_state[key] = None
 
 
-# --------------------------------------------------
-# AUTOMATIC KOTAK DATA FETCH
-# --------------------------------------------------
+# ==================================================
+# CACHED HISTORICAL DATA
+# ==================================================
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(
+    ttl=1800,
+    show_spinner=False,
+)
 def fetch_market_history_cached(
     symbol,
     start_text,
@@ -149,12 +226,13 @@ def fetch_market_history_cached(
     credential_fingerprint,
 ):
     """
-    Find the NSE instrument and fetch daily historical candles.
+    Fetch historical prices using Kotak Neo.
 
-    Cached for 30 minutes to reduce unnecessary API requests.
+    Results are cached for 30 minutes to avoid
+    unnecessary repeated historical API requests.
     """
 
-    # Included in Streamlit's cache key.
+    # Credential fingerprint forms part of the cache key.
     _ = credential_fingerprint
 
     client = create_neo_client()
@@ -165,12 +243,14 @@ def fetch_market_history_cached(
     )
 
     if not lookup["successful"]:
+
         errors = "; ".join(
-            item["error"] for item in lookup["failed"]
+            item["error"]
+            for item in lookup["failed"]
         )
 
         raise RuntimeError(
-            f"Instrument lookup failed for {symbol}. {errors}"
+            f"Instrument lookup failed: {errors}"
         )
 
     prices = fetch_daily_history(
@@ -182,22 +262,31 @@ def fetch_market_history_cached(
 
     if prices.empty:
         raise RuntimeError(
-            f"Kotak Neo returned no daily candles for {symbol}."
+            f"No historical candles received for {symbol}."
         )
 
     return prices
 
 
-# --------------------------------------------------
+# ==================================================
+# HEADER
+# ==================================================
+
+st.title("📈 StockVision AI")
+
+st.caption(
+    "Indian equities · Technical analysis · AI forecasting "
+    "· Fundamental research"
+)
+
+
+# ==================================================
 # SIDEBAR
-# --------------------------------------------------
+# ==================================================
 
-today = datetime.now(
-    ZoneInfo("Asia/Kolkata")
-).date()
+st.sidebar.title("⚙️ Market Settings")
 
-st.sidebar.title("StockVision AI")
-st.sidebar.caption("Market data and analysis")
+today = date.today()
 
 if "selected_symbol" not in st.session_state:
     st.session_state["selected_symbol"] = "RELIANCE"
@@ -208,68 +297,83 @@ symbol = st.sidebar.text_input(
     help="Examples: RELIANCE, TCS, INFY, HDFCBANK",
 ).strip().upper()
 
-periods = {
+period_options = {
     "1 year": 365,
     "3 years": 1095,
     "5 years": 1825,
 }
 
 period_label = st.sidebar.selectbox(
-    "Historical range",
-    list(periods),
-    index=0,
+    "Historical data range",
+    list(period_options.keys()),
+    index=1,
 )
 
-period_days = periods[period_label]
+period_days = period_options[period_label]
 
-start_date = today - timedelta(days=period_days)
+start_date = today - timedelta(
+    days=period_days
+)
+
 end_date = today
 
-refresh = st.sidebar.button(
+refresh_button = st.sidebar.button(
     "↻ Refresh market data",
     use_container_width=True,
 )
 
-request_signature = (
-    symbol,
-    period_days,
+
+# ==================================================
+# REQUEST SIGNATURE
+# ==================================================
+
+credential_fingerprint = (
     hashlib.sha256(
         consumer_key.encode()
-    ).hexdigest()[:16] if consumer_key else "no-key",
+    ).hexdigest()[:16]
+    if consumer_key
+    else "no-key"
+)
+
+request_signature = (
+    f"{symbol}|{period_days}|{credential_fingerprint}"
 )
 
 
-# --------------------------------------------------
-# CSV FALLBACK
-# --------------------------------------------------
+# ==================================================
+# CSV UPLOAD FALLBACK
+# ==================================================
 
 with st.sidebar.expander(
-    "Upload CSV instead",
+    "📂 Upload historical CSV",
     expanded=False,
 ):
 
-    upload = st.file_uploader(
-        "Daily OHLCV CSV",
+    uploaded_file = st.file_uploader(
+        "Upload OHLCV data",
         type=["csv"],
-        help="Required columns: date, open, high, low, close, volume",
+        key="market_csv_upload",
     )
 
-    load_csv = st.button(
+    load_csv_button = st.button(
         "Load uploaded CSV",
-        key="load_csv",
         use_container_width=True,
     )
 
-    if load_csv:
+    if load_csv_button:
 
-        if upload is None:
-            st.warning("Choose a CSV file first.")
+        if uploaded_file is None:
+            st.warning("Please upload a CSV file.")
 
         else:
-            try:
-                uploaded = pd.read_csv(upload)
 
-                required = [
+            try:
+
+                uploaded_df = pd.read_csv(
+                    uploaded_file
+                )
+
+                required_columns = [
                     "date",
                     "open",
                     "high",
@@ -280,26 +384,31 @@ with st.sidebar.expander(
 
                 missing = [
                     column
-                    for column in required
-                    if column not in uploaded.columns
+                    for column in required_columns
+                    if column not in uploaded_df.columns
                 ]
 
                 if missing:
+
                     st.error(
                         "Missing columns: "
                         + ", ".join(missing)
                     )
 
                 else:
+
                     st.session_state["price_data"] = (
-                        uploaded[required].copy()
+                        uploaded_df[required_columns].copy()
                     )
 
                     st.session_state["active_symbol"] = (
                         symbol or "UPLOADED"
                     )
 
-                    st.session_state["data_source"] = "Uploaded CSV"
+                    st.session_state["data_source"] = (
+                        "Uploaded CSV"
+                    )
+
                     st.session_state["data_error"] = None
 
                     st.session_state["auto_fetch_signature"] = (
@@ -308,192 +417,244 @@ with st.sidebar.expander(
 
                     clear_analysis_results()
 
-                    st.success("CSV loaded.")
+                    st.success("Historical CSV loaded.")
 
             except Exception as exc:
-                st.error(f"Could not load CSV: {exc}")
+
+                st.error(
+                    f"CSV loading failed: {exc}"
+                )
 
 
-if refresh:
-    fetch_market_history_cached.clear()
-    st.session_state["auto_fetch_signature"] = None
+st.sidebar.divider()
 
 st.sidebar.caption(
-    "Data loads automatically when the symbol or period changes. "
-    "Kotak data is cached for 30 minutes."
+    "Kotak historical data is cached for 30 minutes. "
+    "A manual refresh bypasses the cache."
 )
 
 
-# --------------------------------------------------
-# AUTOMATIC DATA FETCH
-# --------------------------------------------------
+# ==================================================
+# MANUAL REFRESH
+# ==================================================
+
+if refresh_button:
+
+    fetch_market_history_cached.clear()
+
+    st.session_state["auto_fetch_signature"] = None
+
+
+# ==================================================
+# AUTOMATIC DATA DOWNLOAD
+# ==================================================
 
 if (
-    st.session_state["auto_fetch_signature"] != request_signature
-    and symbol
+    symbol
+    and st.session_state["auto_fetch_signature"]
+    != request_signature
 ):
 
-    st.session_state["auto_fetch_signature"] = request_signature
+    st.session_state["auto_fetch_signature"] = (
+        request_signature
+    )
 
     st.session_state["price_data"] = None
+
     st.session_state["active_symbol"] = None
+
     st.session_state["data_source"] = None
+
+    st.session_state["data_error"] = None
 
     clear_analysis_results()
 
     if has_kotak_key:
 
         try:
+
             with st.spinner(
-                f"Loading {symbol} history from Kotak Neo..."
+                f"Fetching {symbol} historical data from Kotak Neo..."
             ):
 
                 prices = fetch_market_history_cached(
                     symbol,
                     start_date.isoformat(),
                     end_date.isoformat(),
-                    request_signature[2],
+                    credential_fingerprint,
                 )
 
             st.session_state["price_data"] = prices
+
             st.session_state["active_symbol"] = symbol
+
             st.session_state["data_source"] = "Kotak Neo"
+
             st.session_state["data_error"] = None
 
         except Exception as exc:
+
             st.session_state["data_error"] = str(exc)
 
     else:
 
         st.session_state["data_error"] = (
-            "Automatic Kotak data is not configured. "
-            "Add NEO_CONSUMER_KEY in Streamlit app Settings → Secrets, "
-            "or upload a CSV in the sidebar."
+            "Kotak Neo credentials are not configured. "
+            "Add NEO_CONSUMER_KEY in Streamlit Secrets "
+            "or upload historical CSV data."
         )
 
 
-# --------------------------------------------------
-# HEADER AND DATA CHECK
-# --------------------------------------------------
-
-st.title("📈 StockVision AI")
-
-st.caption(
-    "Indian equities · Technical analysis · AI forecasts · "
-    "Fundamental research"
-)
+# ==================================================
+# MARKET DATA STATUS
+# ==================================================
 
 price_df = st.session_state["price_data"]
 
 active_symbol = (
-    st.session_state["active_symbol"] or symbol
+    st.session_state["active_symbol"]
+    or symbol
 )
 
 if price_df is None:
 
-    if st.session_state["data_error"]:
-        st.warning(st.session_state["data_error"])
+    st.warning(
+        st.session_state["data_error"]
+        or "Historical market data is not loaded."
+    )
 
     st.info(
-        "Choose an NSE symbol in the sidebar. With Kotak credentials "
-        "configured, StockVision AI fetches its history automatically."
+        "Choose a stock in the sidebar. StockVision AI "
+        "will fetch its history automatically when Kotak "
+        "Neo credentials and API access are available."
     )
 
     st.markdown(
         """
-        **Enable automatic data on Streamlit Cloud**
+        **Automatic data configuration**
 
-        Open **Manage app → Settings → Secrets** and add:
+        Go to Manage app → Settings → Secrets and add:
 
         ```toml
-        NEO_CONSUMER_KEY = "your_Kotak_Neo_consumer_key"
+        NEO_CONSUMER_KEY = "YOUR_ACTUAL_CONSUMER_KEY"
         NEO_ENVIRONMENT = "prod"
         ```
 
-        Save the secrets and reboot the app. Never commit API keys to GitHub.
+        Never commit your actual credentials to GitHub.
         """
     )
 
     st.stop()
 
 
-# --------------------------------------------------
+# ==================================================
 # FEATURE ENGINEERING
-# --------------------------------------------------
+# ==================================================
 
 try:
-    feature_df = build_features(price_df)
+
+    feature_df = build_features(
+        price_df
+    )
 
 except Exception as exc:
-    st.error(f"Could not prepare market data: {exc}")
+
+    st.error(
+        f"Technical feature calculation failed: {exc}"
+    )
+
     st.stop()
 
+
 if feature_df.empty:
-    st.error("No valid price records are available.")
+
+    st.error(
+        "No valid historical market data is available."
+    )
+
     st.stop()
+
+
+# ==================================================
+# LATEST MARKET VALUES
+# ==================================================
 
 latest = feature_df.iloc[-1]
 
-last_price = float(latest["close"])
+latest_price = float(
+    latest["close"]
+)
 
 previous_price = (
     float(feature_df["close"].iloc[-2])
     if len(feature_df) > 1
-    else last_price
+    else latest_price
 )
 
-change_pct = (
-    ((last_price / previous_price) - 1) * 100
-    if previous_price
+daily_change_pct = (
+    (latest_price / previous_price - 1) * 100
+    if previous_price > 0
     else 0
 )
 
-rsi_value = latest.get("rsi_14", float("nan"))
+latest_rsi = latest.get(
+    "rsi_14",
+    float("nan")
+)
+
+latest_volume = float(
+    latest["volume"]
+)
 
 latest_date = pd.to_datetime(
     latest["date"]
 ).date()
 
 
-# --------------------------------------------------
+# ==================================================
 # MARKET SUMMARY
-# --------------------------------------------------
+# ==================================================
 
 st.caption(
-    f"**{active_symbol}** · {st.session_state['data_source']} · "
+    f"**{active_symbol}** · "
+    f"{st.session_state['data_source']} · "
     f"Latest candle: {latest_date:%d %b %Y} · "
     f"{len(feature_df):,} daily records"
 )
 
-m1, m2, m3, m4 = st.columns(4)
+col1, col2, col3, col4 = st.columns(4)
 
-m1.metric(
-    "Latest close",
-    f"₹{last_price:,.2f}",
-    f"{change_pct:+.2f}%",
+col1.metric(
+    "Latest Close",
+    f"₹{latest_price:,.2f}",
+    f"{daily_change_pct:+.2f}%",
 )
 
-m2.metric(
+col2.metric(
     "RSI (14)",
-    f"{rsi_value:.1f}" if pd.notna(rsi_value) else "N/A",
+    (
+        f"{latest_rsi:.2f}"
+        if pd.notna(latest_rsi)
+        else "N/A"
+    ),
 )
 
-m3.metric(
-    "Daily records",
+col3.metric(
+    "Historical Records",
     f"{len(feature_df):,}",
 )
 
-m4.metric(
-    "Latest volume",
-    f"{float(latest['volume']):,.0f}",
+col4.metric(
+    "Trading Volume",
+    f"{latest_volume:,.0f}",
 )
 
 st.divider()
 
 
-# --------------------------------------------------
-# FOUR MAIN SECTIONS
-# --------------------------------------------------
+# ==================================================
+# MAIN NAVIGATION
+# ==================================================
 
 overview_tab, forecast_tab, research_tab, watchlist_tab = st.tabs(
     [
@@ -506,35 +667,48 @@ overview_tab, forecast_tab, research_tab, watchlist_tab = st.tabs(
 
 
 # ==================================================
-# OVERVIEW
+# SECTION 1 — OVERVIEW
 # ==================================================
 
 with overview_tab:
 
-    st.subheader("Price trend")
+    st.subheader("Price Performance")
 
-    chart_columns = ["close"] + [
+    available_price_columns = [
         column
-        for column in ("sma_20", "sma_50", "sma_200")
-        if column in feature_df.columns
-        and feature_df[column].notna().any()
+        for column in [
+            "close",
+            "sma_20",
+            "sma_50",
+            "sma_200",
+        ]
+        if column == "close"
+        or (
+            column in feature_df.columns
+            and feature_df[column].notna().any()
+        )
     ]
 
     price_chart = px.line(
         feature_df,
         x="date",
-        y=chart_columns,
+        y=available_price_columns,
         labels={
             "date": "Date",
             "value": "Price (₹)",
-            "variable": "",
+            "variable": "Indicator",
         },
     )
 
     price_chart.update_layout(
-        height=430,
+        height=420,
         hovermode="x unified",
-        margin=dict(l=5, r=5, t=15, b=5),
+        margin=dict(
+            l=5,
+            r=5,
+            t=15,
+            b=5,
+        ),
         legend_title_text="",
     )
 
@@ -547,42 +721,52 @@ with overview_tab:
 
     with left:
 
-        st.subheader("Technical signal")
+        st.subheader("Technical Signal")
 
         try:
-            signal = generate_technical_signal(feature_df)
+
+            signal = generate_technical_signal(
+                feature_df
+            )
 
             st.metric(
-                "Technical bias",
+                "Overall Technical Bias",
                 signal["overall_signal"],
             )
 
             st.metric(
-                "Signal score",
+                "Technical Score",
                 f"{signal['score']:+.0f} / 100",
             )
 
-            st.caption(
-                "Rule-based indicator summary, not a probability "
-                "or buy/sell recommendation."
+            st.metric(
+                "RSI Condition",
+                signal["rsi_status"],
             )
 
-        except ValueError:
+            st.caption(
+                "A rule-based technical summary, not a "
+                "buy/sell recommendation."
+            )
+
+        except ValueError as exc:
+
             st.info(
-                f"The combined signal needs a valid 200-day average. "
-                f"Loaded history: {len(feature_df)} daily records."
+                f"Complete signal unavailable: {exc}"
             )
 
     with right:
 
-        st.subheader("Momentum")
-
-        c1, c2 = st.columns(2)
+        st.subheader("Momentum Analysis")
 
         rsi_chart = px.line(
             feature_df,
             x="date",
             y="rsi_14",
+            labels={
+                "rsi_14": "RSI",
+                "date": "Date",
+            },
         )
 
         rsi_chart.add_hline(
@@ -597,35 +781,55 @@ with overview_tab:
 
         rsi_chart.update_layout(
             height=260,
-            margin=dict(l=3, r=3, t=10, b=5),
+            margin=dict(
+                l=5,
+                r=5,
+                t=10,
+                b=5,
+            ),
         )
 
-        macd_chart = px.line(
-            feature_df,
-            x="date",
-            y=["macd", "macd_signal"],
-        )
-
-        macd_chart.update_layout(
-            height=260,
-            margin=dict(l=3, r=3, t=10, b=5),
-        )
-
-        c1.plotly_chart(
+        st.plotly_chart(
             rsi_chart,
             use_container_width=True,
         )
 
-        c2.plotly_chart(
-            macd_chart,
-            use_container_width=True,
-        )
+    st.subheader("MACD")
 
-    with st.expander("Recent indicator readings"):
+    macd_chart = px.line(
+        feature_df,
+        x="date",
+        y=[
+            "macd",
+            "macd_signal",
+        ],
+        labels={
+            "date": "Date",
+            "value": "MACD",
+            "variable": "Indicator",
+        },
+    )
+
+    macd_chart.update_layout(
+        height=300,
+        margin=dict(
+            l=5,
+            r=5,
+            t=10,
+            b=5,
+        ),
+    )
+
+    st.plotly_chart(
+        macd_chart,
+        use_container_width=True,
+    )
+
+    with st.expander("Recent technical readings"):
 
         columns = [
             column
-            for column in (
+            for column in [
                 "date",
                 "close",
                 "sma_20",
@@ -636,14 +840,17 @@ with overview_tab:
                 "atr_14",
                 "volatility_20d",
                 "volume_ratio",
-            )
+            ]
             if column in feature_df.columns
         ]
 
         st.dataframe(
             feature_df[columns]
             .tail(30)
-            .sort_values("date", ascending=False),
+            .sort_values(
+                "date",
+                ascending=False,
+            ),
             use_container_width=True,
             hide_index=True,
         )
@@ -652,85 +859,114 @@ with overview_tab:
 
         st.download_button(
             "Download CSV",
-            data=feature_df.to_csv(index=False).encode("utf-8"),
-            file_name=f"{active_symbol}_stockvision.csv",
+            data=feature_df.to_csv(
+                index=False
+            ).encode("utf-8"),
+            file_name=f"{active_symbol}_historical.csv",
             mime="text/csv",
         )
 
 
 # ==================================================
-# FORECAST LAB
+# SECTION 2 — FORECAST LAB
 # ==================================================
 
 with forecast_tab:
 
-    st.subheader("AI forecasts")
+    st.subheader("AI Forecasting")
 
     st.caption(
-        "XGBoost estimates forward log returns. Forecasts are "
-        "experimental, not guaranteed future prices."
+        "XGBoost models estimate forward returns over selected "
+        "trading-day horizons. Predictions are experimental."
     )
 
-    horizons = st.multiselect(
-        "Forecast horizons",
-        FORECAST_HORIZONS,
+    selected_horizons = st.multiselect(
+        "Select forecast horizons",
+        options=FORECAST_HORIZONS,
         default=[21, 63],
         format_func=lambda x: f"{x} trading days",
         key="forecast_horizons",
     )
 
-    if len(feature_df) < 800:
+    st.info(
+        f"Available historical records: {len(feature_df)}"
+    )
+
+    if len(feature_df) < 500:
 
         st.warning(
-            f"Only {len(feature_df)} trading records are loaded. "
-            "Longer horizons need more history after indicator warm-up."
+            "The dataset may be too small for reliable longer-horizon "
+            "training. Consider collecting more historical data."
         )
 
     if st.button(
-        "Train selected models",
+        "🚀 Train Forecast Models",
         type="primary",
     ):
 
-        if not horizons:
-            st.warning("Select at least one forecast horizon.")
+        if not selected_horizons:
+
+            st.warning(
+                "Please select at least one forecast horizon."
+            )
 
         else:
 
             try:
-                with st.spinner("Training XGBoost models..."):
+
+                with st.spinner(
+                    "Training forecasting models..."
+                ):
 
                     trained = train_forecast_models(
-                        feature_df,
-                        horizons=horizons,
+                        feature_df=feature_df,
+                        horizons=selected_horizons,
                     )
 
-                    predicted = predict_latest(
-                        feature_df,
-                        trained,
+                    forecasts = predict_latest(
+                        feature_df=feature_df,
+                        trained_models=trained,
                     )
 
                 st.session_state["trained_models"] = trained
-                st.session_state["forecasts"] = predicted
+
+                st.session_state["forecasts"] = forecasts
+
+                st.success(
+                    "Forecasting completed successfully."
+                )
 
             except Exception as exc:
-                st.error(f"Model training failed: {exc}")
 
-    trained = st.session_state["trained_models"]
-    predictions = st.session_state["forecasts"]
+                st.error(
+                    f"Forecast training failed: {exc}"
+                )
 
-    if trained and predictions is not None:
+    trained_models = st.session_state["trained_models"]
 
-        display = predictions.copy()
+    forecasts = st.session_state["forecasts"]
+
+    if (
+        trained_models is not None
+        and forecasts is not None
+    ):
+
+        st.divider()
+
+        st.subheader("Forecast Results")
+
+        display = forecasts.copy()
 
         display["Horizon"] = (
-            display["horizon_days"].astype(str) + " days"
+            display["horizon_days"].astype(str)
+            + " trading days"
         )
 
         display = display.rename(
             columns={
-                "current_price": "Current price (₹)",
-                "predicted_price": "Estimated price (₹)",
-                "predicted_return_pct": "Estimated return (%)",
+                "current_price": "Current Price (₹)",
+                "predicted_price": "Estimated Price (₹)",
+                "predicted_return_pct": "Estimated Return (%)",
             }
         )
 
@@ -738,240 +974,426 @@ with forecast_tab:
             display[
                 [
                     "Horizon",
-                    "Current price (₹)",
-                    "Estimated price (₹)",
-                    "Estimated return (%)",
+                    "Current Price (₹)",
+                    "Estimated Price (₹)",
+                    "Estimated Return (%)",
                 ]
             ].style.format({
-                "Current price (₹)": "₹{:,.2f}",
-                "Estimated price (₹)": "₹{:,.2f}",
-                "Estimated return (%)": "{:+.2f}%",
+                "Current Price (₹)": "₹{:,.2f}",
+                "Estimated Price (₹)": "₹{:,.2f}",
+                "Estimated Return (%)": "{:+.2f}%",
             }),
             use_container_width=True,
             hide_index=True,
         )
 
-        evaluation = pd.DataFrame([
-            {
-                "Horizon": f"{h} days",
+        st.subheader("Model Evaluation")
+
+        evaluation_rows = []
+
+        for horizon, result in trained_models.items():
+
+            evaluation_rows.append({
+                "Horizon": f"{horizon} days",
                 "MAE": result["mae"],
                 "RMSE": result["rmse"],
-                "Directional accuracy": (
+                "Directional Accuracy": (
                     result["directional_accuracy"] * 100
                 ),
-                "Validation rows": result["validation_rows"],
-            }
-            for h, result in trained.items()
-        ])
+                "Validation Rows": result["validation_rows"],
+            })
 
-        st.subheader("Chronological holdout evaluation")
+        evaluation = pd.DataFrame(
+            evaluation_rows
+        )
 
         st.dataframe(
             evaluation.style.format({
                 "MAE": "{:.5f}",
                 "RMSE": "{:.5f}",
-                "Directional accuracy": "{:.1f}%",
+                "Directional Accuracy": "{:.2f}%",
             }),
             use_container_width=True,
             hide_index=True,
         )
 
-    with st.expander("Walk-forward backtesting"):
+        st.caption(
+            "Historical holdout performance is not a guarantee "
+            "of future accuracy."
+        )
+
+    # --------------------------------------------------
+    # WALK-FORWARD BACKTEST
+    # --------------------------------------------------
+
+    with st.expander(
+        "🧪 Walk-Forward Backtesting"
+    ):
+
+        st.caption(
+            "Evaluate historical predictions using chronological "
+            "training and testing periods."
+        )
 
         backtest_horizons = st.multiselect(
             "Backtest horizons",
-            FORECAST_HORIZONS,
+            options=FORECAST_HORIZONS,
             default=[21, 63],
             format_func=lambda x: f"{x} trading days",
             key="backtest_horizons",
         )
 
         max_folds = st.slider(
-            "Maximum test periods per horizon",
-            3,
-            20,
-            8,
+            "Maximum historical test periods",
+            min_value=3,
+            max_value=20,
+            value=8,
         )
 
-        if st.button("Run backtest"):
+        if st.button("Run Backtest"):
 
             if not backtest_horizons:
-                st.warning("Select a horizon.")
+
+                st.warning(
+                    "Select at least one horizon."
+                )
 
             else:
 
                 try:
-                    with st.spinner("Running walk-forward backtest..."):
+
+                    with st.spinner(
+                        "Running historical backtest..."
+                    ):
 
                         summary, details = walk_forward_backtest(
-                            feature_df,
+                            feature_df=feature_df,
                             horizons=backtest_horizons,
                             min_train_rows=200,
                             max_folds=max_folds,
                         )
 
                     st.session_state["backtest_summary"] = summary
+
                     st.session_state["backtest_predictions"] = details
 
-                except Exception as exc:
-                    st.error(f"Backtest failed: {exc}")
+                    st.success("Backtest completed.")
 
-        if st.session_state["backtest_summary"] is not None:
+                except Exception as exc:
+
+                    st.error(
+                        f"Backtest failed: {exc}"
+                    )
+
+        summary = st.session_state["backtest_summary"]
+
+        details = st.session_state["backtest_predictions"]
+
+        if summary is not None:
+
+            st.subheader("Backtest Summary")
 
             st.dataframe(
-                st.session_state["backtest_summary"],
+                summary,
                 use_container_width=True,
                 hide_index=True,
             )
 
-        if st.session_state["backtest_predictions"] is not None:
+        if details is not None:
+
+            st.subheader("Historical Forecasts")
 
             st.dataframe(
-                st.session_state["backtest_predictions"],
+                details,
                 use_container_width=True,
                 hide_index=True,
+            )
+
+            st.download_button(
+                "Download Backtest CSV",
+                data=details.to_csv(
+                    index=False
+                ).encode("utf-8"),
+                file_name=f"{active_symbol}_backtest.csv",
+                mime="text/csv",
             )
 
 
 # ==================================================
-# RESEARCH
+# SECTION 3 — RESEARCH
 # ==================================================
 
 with research_tab:
 
-    st.subheader("Research tools")
+    st.subheader("Research Tools")
 
-    # --------------------------------------------------
+    # ==================================================
     # VALUATION
-    # --------------------------------------------------
+    # ==================================================
 
     with st.expander(
-        "Long-term valuation scenarios",
+        "💰 Long-Term Valuation Scenarios",
         expanded=True,
     ):
 
         st.caption(
-            "Illustrative EPS growth and future P/E assumptions."
+            "Enter your assumptions. StockVision AI will calculate "
+            "the Bear, Base and Bull scenarios."
         )
 
-        a, b, c = st.columns(3)
+        with st.form("valuation_form"):
 
-        eps = a.number_input(
-            "Current annual EPS (₹)",
-            0.01,
-            value=10.0,
-            key="val_eps",
-        )
+            col1, col2, col3 = st.columns(3)
 
-        years = b.selectbox(
-            "Forecast period",
-            [3, 5],
-            index=1,
-        )
+            with col1:
 
-        valuation_price = c.number_input(
-            "Current price (₹)",
-            0.01,
-            value=float(last_price),
-            key="val_price",
-        )
-
-        a, b, c = st.columns(3)
-
-        bear_growth = a.number_input(
-            "Bear EPS growth (%)",
-            value=5.0,
-        )
-
-        bear_pe = a.number_input(
-            "Bear future P/E",
-            min_value=0.1,
-            value=15.0,
-        )
-
-        base_growth = b.number_input(
-            "Base EPS growth (%)",
-            value=12.0,
-        )
-
-        base_pe = b.number_input(
-            "Base future P/E",
-            min_value=0.1,
-            value=20.0,
-        )
-
-        bull_growth = c.number_input(
-            "Bull EPS growth (%)",
-            value=18.0,
-        )
-
-        bull_pe = c.number_input(
-            "Bull future P/E",
-            min_value=0.1,
-            value=25.0,
-        )
-
-        if st.button("Calculate scenarios"):
-
-            assumptions = {
-                "Bear": {
-                    "eps_growth": bear_growth / 100,
-                    "future_pe": bear_pe,
-                },
-                "Base": {
-                    "eps_growth": base_growth / 100,
-                    "future_pe": base_pe,
-                },
-                "Bull": {
-                    "eps_growth": bull_growth / 100,
-                    "future_pe": bull_pe,
-                },
-            }
-
-            try:
-                st.session_state["valuation_results"] = (
-                    calculate_long_term_scenarios(
-                        current_price=valuation_price,
-                        current_eps=eps,
-                        years=years,
-                        scenarios=assumptions,
-                    )
+                current_eps = st.number_input(
+                    "Current Annual EPS (₹)",
+                    min_value=0.0,
+                    value=0.0,
+                    step=0.5,
+                    help="Enter verified annual or trailing twelve-month EPS.",
                 )
 
-            except Exception as exc:
-                st.error(f"Valuation failed: {exc}")
+            with col2:
 
-        if st.session_state["valuation_results"] is not None:
+                valuation_years = st.selectbox(
+                    "Forecast Period",
+                    options=[3, 5],
+                    index=1,
+                    format_func=lambda x: f"{x} years",
+                )
 
-            st.dataframe(
-                st.session_state["valuation_results"],
-                use_container_width=True,
-                hide_index=True,
+            with col3:
+
+                valuation_price = st.number_input(
+                    "Current Share Price (₹)",
+                    min_value=0.01,
+                    value=float(latest_price),
+                    step=1.0,
+                )
+
+            st.markdown(
+                "#### Scenario Assumptions"
             )
 
-    # --------------------------------------------------
-    # RISK
-    # --------------------------------------------------
+            col1, col2, col3 = st.columns(3)
 
-    with st.expander("Historical risk analysis"):
+            with col1:
+
+                bear_growth = st.number_input(
+                    "Bear EPS Growth (%)",
+                    value=5.0,
+                    min_value=-99.0,
+                    max_value=100.0,
+                )
+
+                bear_pe = st.number_input(
+                    "Bear Future P/E",
+                    value=15.0,
+                    min_value=0.1,
+                )
+
+            with col2:
+
+                base_growth = st.number_input(
+                    "Base EPS Growth (%)",
+                    value=12.0,
+                    min_value=-99.0,
+                    max_value=100.0,
+                )
+
+                base_pe = st.number_input(
+                    "Base Future P/E",
+                    value=20.0,
+                    min_value=0.1,
+                )
+
+            with col3:
+
+                bull_growth = st.number_input(
+                    "Bull EPS Growth (%)",
+                    value=18.0,
+                    min_value=-99.0,
+                    max_value=100.0,
+                )
+
+                bull_pe = st.number_input(
+                    "Bull Future P/E",
+                    value=25.0,
+                    min_value=0.1,
+                )
+
+            calculate_valuation = st.form_submit_button(
+                "Calculate Scenarios",
+                use_container_width=True,
+                type="primary",
+            )
+
+        if calculate_valuation:
+
+            if current_eps <= 0:
+
+                st.error(
+                    "Please enter the company's actual positive EPS."
+                )
+
+            else:
+
+                scenario_inputs = {
+                    "Bear": {
+                        "eps_growth": bear_growth / 100,
+                        "future_pe": bear_pe,
+                    },
+
+                    "Base": {
+                        "eps_growth": base_growth / 100,
+                        "future_pe": base_pe,
+                    },
+
+                    "Bull": {
+                        "eps_growth": bull_growth / 100,
+                        "future_pe": bull_pe,
+                    },
+                }
+
+                try:
+
+                    valuation_df = (
+                        calculate_long_term_scenarios(
+                            current_price=valuation_price,
+                            current_eps=current_eps,
+                            years=valuation_years,
+                            scenarios=scenario_inputs,
+                        )
+                    )
+
+                    st.session_state["valuation_results"] = (
+                        valuation_df
+                    )
+
+                    st.session_state["valuation_symbol"] = (
+                        active_symbol
+                    )
+
+                    st.session_state["valuation_years"] = (
+                        valuation_years
+                    )
+
+                except Exception as exc:
+
+                    st.error(
+                        f"Valuation calculation failed: {exc}"
+                    )
+
+        results = st.session_state["valuation_results"]
+
+        result_symbol = st.session_state["valuation_symbol"]
+
+        result_years = st.session_state["valuation_years"]
+
+        if (
+            results is not None
+            and result_symbol == active_symbol
+        ):
+
+            st.divider()
+
+            st.subheader(
+                "Your Valuation Results"
+            )
+
+            st.caption(
+                f"{active_symbol} · {result_years}-year scenario analysis"
+            )
+
+            bear = results[
+                results["scenario"] == "Bear"
+            ]
+
+            base = results[
+                results["scenario"] == "Base"
+            ]
+
+            bull = results[
+                results["scenario"] == "Bull"
+            ]
+
+            col1, col2, col3 = st.columns(3)
+
+            scenario_rows = [
+                (col1, bear, "🐻 Bear"),
+                (col2, base, "⚖️ Base"),
+                (col3, bull, "🚀 Bull"),
+            ]
+
+            for column, scenario, heading in scenario_rows:
+
+                if scenario.empty:
+                    continue
+
+                row = scenario.iloc[0]
+
+                with column:
+
+                    st.markdown(
+                        f"#### {heading}"
+                    )
+
+                    st.metric(
+                        "Estimated Future Price",
+                        f"₹{row['estimated_future_price']:,.2f}",
+                        (
+                            f"{row['total_price_return_pct']:+.2f}% "
+                            "total return"
+                        ),
+                    )
+
+                    st.caption(
+                        f"Annualized return: "
+                        f"{row['annualized_price_return_pct']:+.2f}%"
+                    )
+
+            st.caption(
+                "Assumption-driven estimates, not guaranteed targets "
+                "or intrinsic fair values. Dividends, dilution and "
+                "corporate actions are excluded."
+            )
+
+    # ==================================================
+    # RISK ANALYSIS
+    # ==================================================
+
+    with st.expander(
+        "⚠️ Historical Risk Analysis"
+    ):
+
+        st.caption(
+            "Measure historical volatility, drawdown and "
+            "risk-adjusted returns."
+        )
 
         risk_rate = st.number_input(
-            "Annual risk-free rate (%)",
-            0.0,
-            30.0,
-            6.0,
-            0.25,
+            "Annual Risk-Free Rate (%)",
+            min_value=0.0,
+            max_value=30.0,
+            value=6.0,
+            step=0.25,
         )
 
         confidence = st.selectbox(
-            "VaR confidence",
-            [0.90, 0.95, 0.99],
+            "VaR Confidence Level",
+            options=[0.90, 0.95, 0.99],
             index=1,
+            format_func=lambda x: f"{x:.0%}",
         )
 
-        if st.button("Calculate risk metrics"):
+        if st.button(
+            "Calculate Risk Metrics"
+        ):
 
             try:
+
                 st.session_state["risk_results"] = (
                     calculate_risk_metrics(
                         feature_df,
@@ -981,76 +1403,105 @@ with research_tab:
                 )
 
             except Exception as exc:
-                st.error(f"Risk calculation failed: {exc}")
+
+                st.error(
+                    f"Risk calculation failed: {exc}"
+                )
 
         risk = st.session_state["risk_results"]
 
         if risk is not None:
 
-            cols = st.columns(4)
+            a, b, c, d = st.columns(4)
 
-            cols[0].metric(
-                "Annual volatility",
+            a.metric(
+                "Annual Volatility",
                 f"{risk['annualized_volatility_pct']:.2f}%",
             )
 
-            cols[1].metric(
-                "Maximum drawdown",
+            b.metric(
+                "Maximum Drawdown",
                 f"{risk['maximum_drawdown_pct']:.2f}%",
             )
 
-            cols[2].metric(
-                "Sharpe ratio",
+            c.metric(
+                "Sharpe Ratio",
                 f"{risk['sharpe_ratio']:.2f}",
             )
 
-            cols[3].metric(
+            d.metric(
                 "Daily VaR",
                 f"{risk['daily_var_pct']:.2f}%",
             )
 
             st.caption(
-                "Historical estimates do not define maximum future losses."
+                "Historical risk estimates are not guarantees "
+                "of future losses."
             )
 
-    # --------------------------------------------------
-    # FUNDAMENTALS
-    # --------------------------------------------------
+    # ==================================================
+    # FUNDAMENTAL ANALYSIS
+    # ==================================================
 
-    with st.expander("Fundamental analysis"):
+    with st.expander(
+        "🏢 Fundamental Analysis"
+    ):
+
+        st.caption(
+            "Upload verified company financial statements "
+            "to calculate growth, profitability and leverage ratios."
+        )
 
         financial_file = st.file_uploader(
-            "Annual financial statements CSV",
+            "Annual Financial Statements CSV",
             type=["csv"],
             key="fundamentals_upload",
         )
 
         st.caption(
-            "Required columns: fiscal_year, revenue, operating_profit, "
-            "net_profit, eps, total_equity, total_debt, current_assets, "
-            "current_liabilities. Use consistent units and consolidated statements."
+            "Required: fiscal_year, revenue, operating_profit, "
+            "net_profit, eps, total_equity, total_debt, "
+            "current_assets and current_liabilities."
         )
 
-        if st.button("Analyse fundamentals"):
+        if st.button(
+            "Analyse Fundamentals"
+        ):
 
             if financial_file is None:
-                st.warning("Upload a financial statements CSV first.")
+
+                st.warning(
+                    "Upload financial statements first."
+                )
 
             else:
 
                 try:
-                    financials = pd.read_csv(financial_file)
 
-                    result = analyze_fundamentals(
-                        financials,
-                        market_price=last_price,
+                    financials = pd.read_csv(
+                        financial_file
                     )
 
-                    st.session_state["fundamental_results"] = result
-                    st.session_state["fundamental_symbol"] = active_symbol
+                    fundamental_results = (
+                        analyze_fundamentals(
+                            financials,
+                            market_price=latest_price,
+                        )
+                    )
+
+                    st.session_state["fundamental_results"] = (
+                        fundamental_results
+                    )
+
+                    st.session_state["fundamental_symbol"] = (
+                        active_symbol
+                    )
 
                 except Exception as exc:
-                    st.error(f"Fundamental analysis failed: {exc}")
+
+                    st.error(
+                        f"Fundamental analysis failed: {exc}"
+                    )
 
         fundamentals = st.session_state["fundamental_results"]
 
@@ -1059,23 +1510,83 @@ with research_tab:
             and st.session_state["fundamental_symbol"] == active_symbol
         ):
 
-            st.dataframe(
-                pd.DataFrame([
-                    {"Metric": k, "Value": v}
-                    for k, v in fundamentals.items()
-                ]),
-                use_container_width=True,
-                hide_index=True,
+            st.subheader("Financial Health")
+
+            a, b, c, d = st.columns(4)
+
+            a.metric(
+                "EPS",
+                f"₹{fundamentals['eps']:,.2f}",
             )
+
+            b.metric(
+                "P/E",
+                (
+                    f"{fundamentals['pe_ratio']:.2f}"
+                    if pd.notna(fundamentals["pe_ratio"])
+                    else "N/A"
+                ),
+            )
+
+            c.metric(
+                "ROE",
+                (
+                    f"{fundamentals['roe_pct']:.2f}%"
+                    if pd.notna(fundamentals["roe_pct"])
+                    else "N/A"
+                ),
+            )
+
+            d.metric(
+                "Debt / Equity",
+                (
+                    f"{fundamentals['debt_to_equity']:.2f}"
+                    if pd.notna(fundamentals["debt_to_equity"])
+                    else "N/A"
+                ),
+            )
+
+            st.subheader("Growth and Profitability")
+
+            display_metrics = {
+                "Revenue Growth": fundamentals["revenue_growth_pct"],
+                "Operating Profit Growth": fundamentals["operating_profit_growth_pct"],
+                "Net Profit Growth": fundamentals["net_profit_growth_pct"],
+                "EPS Growth": fundamentals["eps_growth_pct"],
+                "Operating Margin": fundamentals["operating_margin_pct"],
+                "Net Profit Margin": fundamentals["net_profit_margin_pct"],
+                "ROCE": fundamentals["roce_pct"],
+                "Current Ratio": fundamentals["current_ratio"],
+            }
+
+            for label, value in display_metrics.items():
+
+                if pd.notna(value):
+
+                    formatted = (
+                        f"{value:.2f}%"
+                        if "Growth" in label or "Margin" in label or label == "ROCE"
+                        else f"{value:.2f}"
+                    )
+
+                    st.write(
+                        f"**{label}:** {formatted}"
+                    )
+
+                else:
+
+                    st.write(
+                        f"**{label}:** N/A"
+                    )
 
 
 # ==================================================
-# WATCHLIST AND SCANNER
+# SECTION 4 — WATCHLIST
 # ==================================================
 
 with watchlist_tab:
 
-    st.subheader("NSE watchlist")
+    st.subheader("⭐ NSE Watchlist")
 
     with st.form(
         "watchlist_add_form",
@@ -1083,17 +1594,19 @@ with watchlist_tab:
     ):
 
         new_symbol = st.text_input(
-            "Add stock symbol",
+            "Add NSE stock",
             placeholder="Example: TCS",
         )
 
         add_clicked = st.form_submit_button(
-            "Add to watchlist"
+            "Add to Watchlist",
+            use_container_width=True,
         )
 
     if add_clicked:
 
         try:
+
             result = add_symbol(new_symbol)
 
             if result["success"]:
@@ -1102,15 +1615,23 @@ with watchlist_tab:
                 st.info(result["message"])
 
         except Exception as exc:
-            st.error(f"Could not add symbol: {exc}")
+
+            st.error(str(exc))
 
     watchlist = load_watchlist()
 
     if watchlist.empty:
 
-        st.info("Your watchlist is empty.")
+        st.info(
+            "Your watchlist is empty. Add your first stock above."
+        )
 
     else:
+
+        st.metric(
+            "Saved Stocks",
+            len(watchlist),
+        )
 
         st.dataframe(
             watchlist,
@@ -1118,88 +1639,114 @@ with watchlist_tab:
             hide_index=True,
         )
 
-        remove_choice = st.selectbox(
-            "Remove a symbol",
-            [""] + watchlist["symbol"].tolist(),
-            key="remove_choice",
-        )
-
-        if st.button("Remove selected symbol"):
-
-            if remove_choice:
-
-                try:
-                    remove_symbol(remove_choice)
-                    st.rerun()
-
-                except Exception as exc:
-                    st.error(str(exc))
-
-        st.divider()
-
-        st.subheader("Watchlist scanner")
-
-        scan_days = st.selectbox(
-            "Scanner history",
-            [500, 750, 1000],
-            index=1,
-            format_func=lambda x: f"{x} calendar days",
+        selected_remove = st.selectbox(
+            "Select stock to remove",
+            options=[""] + watchlist["symbol"].tolist(),
+            key="watchlist_remove",
         )
 
         if st.button(
-            "Scan watchlist",
-            type="primary",
+            "Remove Selected Stock"
         ):
 
-            try:
-                with st.spinner(
-                    "Looking up tokens and scanning stocks..."
-                ):
+            if selected_remove:
 
-                    client = create_neo_client()
+                try:
 
-                    update_instruments(
-                        watchlist["symbol"].tolist(),
-                        client=client,
+                    remove_symbol(selected_remove)
+
+                    st.session_state["scanner_results"] = None
+
+                    st.success(
+                        f"{selected_remove} removed."
                     )
 
-                    results = scan_watchlist(
-                        watchlist,
-                        lookback_days=scan_days,
-                        client=client,
+                    st.rerun()
+
+                except Exception as exc:
+
+                    st.error(str(exc))
+
+        # --------------------------------------------------
+        # WATCHLIST SCANNER
+        # --------------------------------------------------
+
+        with st.expander(
+            "🔍 Scan all watchlist stocks"
+        ):
+
+            lookback = st.selectbox(
+                "Scanner history",
+                [500, 750, 1000],
+                index=1,
+                format_func=lambda x: f"{x} calendar days",
+            )
+
+            if st.button(
+                "Run Watchlist Scanner",
+                type="primary",
+            ):
+
+                try:
+
+                    with st.spinner(
+                        "Searching instruments and analysing stocks..."
+                    ):
+
+                        client = create_neo_client()
+
+                        update_instruments(
+                            watchlist["symbol"].tolist(),
+                            client=client,
+                        )
+
+                        scanner_results = scan_watchlist(
+                            watchlist_df=watchlist,
+                            lookback_days=lookback,
+                            client=client,
+                        )
+
+                    st.session_state["scanner_results"] = (
+                        scanner_results
                     )
 
-                st.session_state["scanner_results"] = results
+                    st.success(
+                        "Watchlist scan completed."
+                    )
 
-            except Exception as exc:
-                st.error(f"Scanner failed: {exc}")
+                except Exception as exc:
 
-        results = st.session_state["scanner_results"]
+                    st.error(
+                        f"Scanner failed: {exc}"
+                    )
 
-        if results is not None:
+            results = st.session_state["scanner_results"]
 
-            st.dataframe(
-                results,
-                use_container_width=True,
-                hide_index=True,
-            )
+            if results is not None:
 
-            st.download_button(
-                "Download scan results",
-                results.to_csv(index=False).encode("utf-8"),
-                file_name="stockvision_watchlist_scan.csv",
-                mime="text/csv",
-            )
+                st.dataframe(
+                    results,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                st.download_button(
+                    "Download Scanner CSV",
+                    data=results.to_csv(
+                        index=False
+                    ).encode("utf-8"),
+                    file_name="stockvision_scanner.csv",
+                    mime="text/csv",
+                )
 
 
-# --------------------------------------------------
+# ==================================================
 # FOOTER
-# --------------------------------------------------
+# ==================================================
 
 st.divider()
 
 st.caption(
     "StockVision AI · Experimental financial research software · "
-    "Market data may be delayed. Forecasts and valuation scenarios are uncertain."
+    "Forecasts are uncertain and are not investment advice."
 )
-
