@@ -14,9 +14,9 @@ from sklearn.metrics import (
 from xgboost import XGBRegressor
 
 
-# --------------------------------------------------
+# ==================================================
 # PROJECT CONFIGURATION
-# --------------------------------------------------
+# ==================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MODEL_DIR = PROJECT_ROOT / "models"
@@ -24,9 +24,9 @@ MODEL_DIR = PROJECT_ROOT / "models"
 FORECAST_HORIZONS = [21, 63, 126, 252]
 
 
-# --------------------------------------------------
+# ==================================================
 # MODEL FEATURES
-# --------------------------------------------------
+# ==================================================
 
 FEATURE_COLUMNS = [
     "daily_return",
@@ -56,19 +56,26 @@ MACD_SOURCE_COLUMNS = [
     "macd_histogram",
 ]
 
+DERIVED_MACD_FEATURES = [
+    "macd_percent",
+    "macd_signal_percent",
+    "macd_histogram_percent",
+]
 
-# --------------------------------------------------
+
+# ==================================================
 # PREPARE MODEL DATA
-# --------------------------------------------------
+# ==================================================
 
 def prepare_model_data(feature_df):
     """
-    Prepare technical features and future log-return targets.
+    Prepare technical features for model training.
 
-    Target:
-        log(future closing price / current closing price)
+    MACD percentage features are calculated before they
+    are selected for model training.
 
-    This avoids training directly on absolute stock-price changes.
+    Future targets are created separately inside
+    train_one_horizon().
     """
 
     if not isinstance(feature_df, pd.DataFrame):
@@ -76,16 +83,17 @@ def prepare_model_data(feature_df):
             "feature_df must be a pandas DataFrame."
         )
 
-    required_columns = {
-        "date",
-        "close",
-        *MACD_SOURCE_COLUMNS,
-        *[c for c in FEATURE_COLUMNS if c not in {
-            "macd_percent",
-            "macd_signal_percent",
-            "macd_histogram_percent",
-        }],
-    }
+    raw_features = [
+        column
+        for column in FEATURE_COLUMNS
+        if column not in DERIVED_MACD_FEATURES
+    ]
+
+    required_columns = (
+        {"date", "close"}
+        | set(raw_features)
+        | set(MACD_SOURCE_COLUMNS)
+    )
 
     missing = required_columns - set(feature_df.columns)
 
@@ -103,7 +111,7 @@ def prepare_model_data(feature_df):
     )
 
     numeric_columns = list(
-        set(FEATURE_COLUMNS + MACD_SOURCE_COLUMNS + ["close"])
+        set(raw_features + MACD_SOURCE_COLUMNS + ["close"])
     )
 
     for column in numeric_columns:
@@ -124,7 +132,7 @@ def prepare_model_data(feature_df):
 
     if df.empty:
         raise ValueError(
-            "No valid price data is available."
+            "No valid historical price data is available."
         )
 
     if (df["close"] <= 0).any():
@@ -132,8 +140,12 @@ def prepare_model_data(feature_df):
             "Closing prices must be positive."
         )
 
-    # Percentage-scaled MACD features.
-    df["macd_percent"] = df["macd"] / df["close"]
+    # Calculate derived MACD percentage features.
+    # These must exist before FEATURE_COLUMNS are selected.
+
+    df["macd_percent"] = (
+        df["macd"] / df["close"]
+    )
 
     df["macd_signal_percent"] = (
         df["macd_signal"] / df["close"]
@@ -149,15 +161,15 @@ def prepare_model_data(feature_df):
         .replace([np.inf, -np.inf], np.nan)
     )
 
-    # Preserve chronological row positions.
+    # Preserve chronological positions.
     df["_position"] = np.arange(len(df))
 
     return df, FEATURE_COLUMNS.copy()
 
 
-# --------------------------------------------------
+# ==================================================
 # CREATE XGBOOST MODEL
-# --------------------------------------------------
+# ==================================================
 
 def create_model():
     """Create an XGBoost regression model."""
@@ -176,9 +188,9 @@ def create_model():
     )
 
 
-# --------------------------------------------------
+# ==================================================
 # TRAIN ONE FORECAST HORIZON
-# --------------------------------------------------
+# ==================================================
 
 def train_one_horizon(
     df,
@@ -190,13 +202,18 @@ def train_one_horizon(
     """
     Train and evaluate one forecasting horizon.
 
-    Uses chronological holdout validation.
+    Target:
+        log(future close / current close)
 
-    Training samples whose future target overlaps
-    the validation period are excluded.
+    Validation:
+        Chronological holdout split.
 
-    A separate final model is fitted on all labelled
-    observations for the latest forecast.
+    Leakage prevention:
+        Training targets that overlap the validation
+        period are excluded.
+
+    Final model:
+        Refitted on every available labelled observation.
     """
 
     horizon = int(horizon)
@@ -208,7 +225,8 @@ def train_one_horizon(
 
     if not 0 < test_size < 0.5:
         raise ValueError(
-            "test_size must be greater than 0 and less than 0.5."
+            "test_size must be greater than 0 "
+            "and less than 0.5."
         )
 
     working = df.copy().reset_index(drop=True)
@@ -218,7 +236,7 @@ def train_one_horizon(
 
     target_column = f"target_{horizon}d"
 
-    # Future log return over the requested horizon.
+    # Calculate forward log-return targets.
     working[target_column] = np.log(
         working["close"].shift(-horizon)
         / working["close"]
@@ -228,22 +246,21 @@ def train_one_horizon(
 
     if total_rows < 150:
         raise ValueError(
-            f"Not enough historical data for the {horizon}-day model. "
+            f"Not enough historical data for the "
+            f"{horizon}-day model. "
             "Collect more daily price history."
         )
 
     if horizon >= total_rows:
         raise ValueError(
-            f"Not enough observations for a {horizon}-day forecast."
+            f"Not enough observations for a "
+            f"{horizon}-day forecast."
         )
 
     # --------------------------------------------------
     # CHRONOLOGICAL VALIDATION SPLIT
     # --------------------------------------------------
 
-    # Reserve rows for the validation period.
-    # Also reserve the future horizon needed to calculate
-    # actual validation targets.
     validation_rows = max(
         20,
         int(total_rows * test_size)
@@ -255,8 +272,8 @@ def train_one_horizon(
 
     if maximum_validation_rows < 20:
         raise ValueError(
-            f"Insufficient historical data for the {horizon}-day model. "
-            "Collect more daily price history."
+            f"Insufficient historical data for "
+            f"{horizon}-day validation."
         )
 
     validation_rows = min(
@@ -270,8 +287,7 @@ def train_one_horizon(
             f"for the {horizon}-day model."
         )
 
-    # Move the training boundary earlier to account for
-    # the future target period.
+    # Reserve the future horizon and validation rows.
     split_position = (
         total_rows - horizon - validation_rows
     )
@@ -287,7 +303,10 @@ def train_one_horizon(
 
     test_mask = (
         (working["_position"] >= split_position)
-        & (working["_position"] < split_position + validation_rows)
+        & (
+            working["_position"]
+            < split_position + validation_rows
+        )
         & working[target_column].notna()
     )
 
@@ -301,19 +320,21 @@ def train_one_horizon(
 
     if len(train_data) < 100:
         raise ValueError(
-            f"Insufficient training data for the {horizon}-day model. "
+            f"Insufficient training data for the "
+            f"{horizon}-day model. "
             f"Available training rows: {len(train_data)}. "
             "Collect more historical data."
         )
 
     if len(test_data) < 20:
         raise ValueError(
-            f"Insufficient validation data for the {horizon}-day model. "
-            f"Available test rows: {len(test_data)}."
+            f"Insufficient validation data for the "
+            f"{horizon}-day model. "
+            f"Available validation rows: {len(test_data)}."
         )
 
     # --------------------------------------------------
-    # VALIDATION TRAINING
+    # VALIDATION MODEL
     # --------------------------------------------------
 
     X_train = train_data[feature_columns]
@@ -337,7 +358,10 @@ def train_one_horizon(
     )
 
     rmse = np.sqrt(
-        mean_squared_error(y_test, predictions)
+        mean_squared_error(
+            y_test,
+            predictions
+        )
     )
 
     # Directional accuracy.
@@ -354,11 +378,12 @@ def train_one_horizon(
     )
 
     # --------------------------------------------------
-    # FINAL MODEL TRAINING
+    # FINAL MODEL
     # --------------------------------------------------
 
-    # Include every observation whose future target
-    # is already known in the current historical dataset.
+    # All historical observations with known targets
+    # can now be included in the final training model.
+
     labelled_data = working.dropna(
         subset=feature_columns + [target_column]
     )
@@ -371,7 +396,7 @@ def train_one_horizon(
     )
 
     # --------------------------------------------------
-    # SAVE TRAINED MODEL
+    # SAVE MODEL
     # --------------------------------------------------
 
     model_dir = Path(model_dir)
@@ -412,9 +437,9 @@ def train_one_horizon(
     }
 
 
-# --------------------------------------------------
+# ==================================================
 # TRAIN ALL FORECAST MODELS
-# --------------------------------------------------
+# ==================================================
 
 def train_forecast_models(
     feature_df,
@@ -430,8 +455,6 @@ def train_forecast_models(
         63 trading days
         126 trading days
         252 trading days
-
-    Returns a dictionary of trained models and metrics.
     """
 
     df, feature_columns = prepare_model_data(
@@ -474,17 +497,17 @@ def train_forecast_models(
     return trained_models
 
 
-# --------------------------------------------------
+# ==================================================
 # GENERATE LATEST FORECASTS
-# --------------------------------------------------
+# ==================================================
 
 def predict_latest(
     feature_df,
     trained_models,
 ):
     """
-    Generate estimated future prices using the latest
-    available technical feature row.
+    Generate estimates using the latest available
+    technical indicator row.
 
     Returns a DataFrame containing:
         horizon_days
@@ -530,7 +553,7 @@ def predict_latest(
 
         if X_latest.isna().any().any():
             raise ValueError(
-                "Latest row contains missing model features. "
+                "The latest row contains missing model features. "
                 "Collect more historical data."
             )
 
@@ -540,8 +563,8 @@ def predict_latest(
 
         if not np.isfinite(predicted_log_return):
             raise ValueError(
-                f"Model returned an invalid prediction "
-                f"for the {horizon}-day horizon."
+                f"Invalid prediction for the "
+                f"{horizon}-day horizon."
             )
 
         predicted_return = (
@@ -554,7 +577,7 @@ def predict_latest(
 
         if not np.isfinite(predicted_price):
             raise ValueError(
-                f"Predicted price is outside the valid numerical "
+                f"Predicted price is outside the numerical "
                 f"range for the {horizon}-day horizon."
             )
 
@@ -574,9 +597,9 @@ def predict_latest(
     )
 
 
-# --------------------------------------------------
+# ==================================================
 # LOAD SAVED MODEL
-# --------------------------------------------------
+# ==================================================
 
 def load_saved_model(
     horizon,
