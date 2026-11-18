@@ -371,15 +371,15 @@ st.divider()
 # DASHBOARD TABS
 # --------------------------------------------------
 
-tab1, tab2, tab3, tab4 = st.tabs(
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
     [
         "📈 Market Analysis",
         "🤖 AI Forecasts",
         "💰 Long-Term Valuation",
         "📋 Historical Data",
+        "🧪 Backtesting",
     ]
 )
-
 
 # --------------------------------------------------
 # TAB 1: MARKET ANALYSIS
@@ -850,7 +850,167 @@ with tab4:
         mime="text/csv",
     )
 
+# --------------------------------------------------
+# TAB 5: WALK-FORWARD BACKTESTING
+# --------------------------------------------------
 
+with tab5:
+
+    st.subheader("🧪 Historical Walk-Forward Backtesting")
+
+    st.write(
+        "Test historical forecasts using models trained only "
+        "on information that would have been available "
+        "at each forecast date."
+    )
+
+    backtest_horizons = st.multiselect(
+        "Select backtesting horizons",
+        options=FORECAST_HORIZONS,
+        default=[21, 63],
+        format_func=lambda x: f"{x} trading days",
+        key="backtest_horizons",
+    )
+
+    max_folds = st.slider(
+        "Maximum historical test periods per horizon",
+        min_value=3,
+        max_value=20,
+        value=10,
+    )
+
+    run_backtest = st.button(
+        "🚀 Run Walk-Forward Backtest",
+        type="primary",
+    )
+
+    if run_backtest:
+
+        if not backtest_horizons:
+            st.warning("Select at least one horizon.")
+
+        else:
+            try:
+                with st.spinner(
+                    "Running historical model evaluations..."
+                ):
+
+                    summary_df, predictions_df = (
+                        walk_forward_backtest(
+                            feature_df=price_df,
+                            horizons=backtest_horizons,
+                            min_train_rows=200,
+                            max_folds=max_folds,
+                        )
+                    )
+
+                    st.session_state.backtest_summary = summary_df
+                    st.session_state.backtest_predictions = (
+                        predictions_df
+                    )
+
+                st.success("Backtesting completed!")
+
+            except Exception as error:
+                st.error(f"Backtesting failed: {error}")
+
+    summary_df = st.session_state.get(
+        "backtest_summary"
+    )
+
+    predictions_df = st.session_state.get(
+        "backtest_predictions"
+    )
+
+    if summary_df is not None and predictions_df is not None:
+
+        st.divider()
+
+        st.subheader("Backtest Performance")
+
+        display_summary = summary_df.copy()
+
+        display_summary["Horizon"] = (
+            display_summary["horizon_days"].astype(str)
+            + " trading days"
+        )
+
+        st.dataframe(
+            display_summary[
+                [
+                    "Horizon",
+                    "number_of_forecasts",
+                    "mae",
+                    "rmse",
+                    "baseline_mae",
+                    "mae_improvement_pct",
+                    "directional_accuracy_pct",
+                ]
+            ].style.format({
+                "mae": "{:.5f}",
+                "rmse": "{:.5f}",
+                "baseline_mae": "{:.5f}",
+                "mae_improvement_pct": "{:+.2f}%",
+                "directional_accuracy_pct": "{:.2f}%",
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.caption(
+            "MAE and RMSE measure forward log-return errors. "
+            "The baseline assumes zero forward return. "
+            "Positive MAE improvement means the model had "
+            "lower error than this baseline."
+        )
+
+        st.subheader("Predicted vs Actual Returns")
+
+        comparison_chart = px.scatter(
+            predictions_df,
+            x="actual_return_pct",
+            y="predicted_return_pct",
+            color="horizon_days",
+            hover_data=[
+                "forecast_date",
+                "target_date",
+            ],
+            title="Historical Forecast Comparison",
+            labels={
+                "actual_return_pct": "Actual Return (%)",
+                "predicted_return_pct": "Predicted Return (%)",
+                "horizon_days": "Horizon (Trading Days)",
+            },
+        )
+
+        st.plotly_chart(
+            comparison_chart,
+            use_container_width=True,
+        )
+
+        st.subheader("Individual Historical Forecasts")
+
+        st.dataframe(
+            predictions_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        backtest_csv = predictions_df.to_csv(
+            index=False
+        ).encode("utf-8")
+
+        st.download_button(
+            "⬇️ Download Backtest Results",
+            data=backtest_csv,
+            file_name=f"{active_symbol}_backtest.csv",
+            mime="text/csv",
+        )
+
+    else:
+        st.info(
+            "Run a backtest to see historical model performance."
+        )
 # --------------------------------------------------
 # FOOTER
 # --------------------------------------------------
