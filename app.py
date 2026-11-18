@@ -3,6 +3,7 @@ import pandas as pd
 import plotly.express as px
 from datetime import date, timedelta
 from pathlib import Path
+from stockvision.instruments import update_instruments
 
 from stockvision.data import fetch_daily_history
 from stockvision.features import build_features
@@ -72,6 +73,43 @@ symbol = st.sidebar.text_input(
     "NSE Stock Symbol",
     value="RELIANCE",
 ).strip().upper()
+
+if st.sidebar.button(
+    "🔎 Find and Save NSE Token",
+    use_container_width=True,
+):
+    if not symbol:
+        st.sidebar.error("Enter a stock symbol first.")
+
+    else:
+        with st.spinner(
+            f"Searching Kotak Neo for {symbol}..."
+        ):
+            try:
+                result = update_instruments([symbol])
+
+                if result["successful"]:
+                    instrument = result["successful"][0]
+
+                    st.sidebar.success(
+                        f"{symbol} instrument saved!"
+                    )
+
+                    st.sidebar.code(
+                        f"Exchange: {instrument['exchange_segment']}\n"
+                        f"Token: {instrument['instrument_token']}"
+                    )
+
+                else:
+                    for failure in result["failed"]:
+                        st.sidebar.error(
+                            f"{failure['symbol']}: {failure['error']}"
+                        )
+
+            except Exception as error:
+                st.sidebar.error(
+                    f"Instrument search failed: {error}"
+                )
 
 today = date.today()
 
