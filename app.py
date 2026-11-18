@@ -12,7 +12,7 @@ import streamlit as st
 
 
 # ============================================================
-# IMPORT PROJECT MODULES
+# IMPORTS
 # ============================================================
 
 from stockvision.data import (
@@ -23,11 +23,6 @@ from stockvision.data import (
 from stockvision.features import build_features
 
 from stockvision.instruments import update_instruments
-
-from stockvision.modeling import (
-    train_forecast_models,
-    predict_latest,
-)
 
 from stockvision.fundamentals import (
     fetch_auto_fundamentals,
@@ -53,14 +48,14 @@ from stockvision.scanner import (
 
 
 # ============================================================
-# PAGE CONFIGURATION
+# CONFIGURATION
 # ============================================================
 
 st.set_page_config(
     page_title="StockVision AI",
     page_icon="📈",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 LONG_TERM_YEARS = 5
@@ -78,7 +73,7 @@ PERIOD_OPTIONS = {
 
 
 # ============================================================
-# DASHBOARD DESIGN
+# CUSTOM DESIGN
 # ============================================================
 
 st.markdown(
@@ -87,13 +82,13 @@ st.markdown(
 
     .block-container {
         max-width: 1450px;
-        padding-top: 1.4rem;
+        padding-top: 1.3rem;
         padding-bottom: 2rem;
     }
 
     div[data-testid="stMetric"] {
         background: rgba(125, 135, 150, 0.07);
-        border: 1px solid rgba(150, 150, 150, 0.18);
+        border: 1px solid rgba(150, 150, 150, 0.16);
         border-radius: 12px;
         padding: 13px;
     }
@@ -122,10 +117,9 @@ st.markdown(
 # ============================================================
 
 def load_kotak_credentials():
-    """Read credentials from Streamlit Cloud Secrets or environment."""
 
     try:
-        consumer_key = st.secrets.get(
+        key = st.secrets.get(
             "NEO_CONSUMER_KEY",
             "",
         )
@@ -136,26 +130,23 @@ def load_kotak_credentials():
         )
 
     except Exception:
-        consumer_key = ""
+        key = ""
         environment = "prod"
 
-    if consumer_key:
-        os.environ["NEO_CONSUMER_KEY"] = str(
-            consumer_key
-        ).strip()
+    if key:
+        os.environ["NEO_CONSUMER_KEY"] = str(key).strip()
 
     if environment:
-        os.environ["NEO_ENVIRONMENT"] = str(
-            environment
-        ).strip()
+        os.environ["NEO_ENVIRONMENT"] = str(environment).strip()
 
-    key = os.getenv(
+    actual_key = os.getenv(
         "NEO_CONSUMER_KEY",
         "",
     ).strip()
 
     return bool(
-        key and not key.startswith("YOUR_")
+        actual_key
+        and not actual_key.startswith("YOUR_")
     )
 
 
@@ -176,6 +167,7 @@ CREDENTIAL_HASH = (
 
 DEFAULT_STATE = {
     "selected_symbol": "RELIANCE",
+    "selected_company_name": "Reliance Industries Limited",
 
     "price_data": None,
     "active_symbol": None,
@@ -192,19 +184,118 @@ for key, value in DEFAULT_STATE.items():
         st.session_state[key] = value
 
 
-def clear_stock_data():
-    """Clear old market data and dependent session results."""
+def clear_market_state():
 
-    st.session_state["price_data"] = None
-    st.session_state["active_symbol"] = None
-    st.session_state["data_source"] = None
-    st.session_state["data_error"] = None
-    st.session_state["fetch_signature"] = None
-    st.session_state["scanner_results"] = None
+    for key in (
+        "price_data",
+        "active_symbol",
+        "data_source",
+        "data_error",
+        "fetch_signature",
+        "scanner_results",
+    ):
+        st.session_state[key] = None
 
 
 # ============================================================
-# CACHED KOTAK MARKET DATA
+# LIVE NSE COMPANY SEARCH
+# ============================================================
+
+@st.cache_data(
+    ttl=3600,
+    show_spinner=False,
+)
+def search_nse_companies(query):
+    """
+    Search Yahoo Finance for NSE-listed companies.
+
+    Returns:
+        symbol, company_name, exchange, sector-independent profile
+
+    Only NSE equity symbols ending in .NS are returned.
+    """
+
+    query = str(query).strip()
+
+    columns = [
+        "symbol",
+        "company_name",
+        "exchange",
+    ]
+
+    if len(query) < 2:
+        return pd.DataFrame(columns=columns)
+
+    try:
+        import yfinance as yf
+
+        search = yf.Search(
+            query,
+            max_results=15,
+            news_count=0,
+            lists_count=0,
+            include_cb=False,
+            include_nav_links=False,
+            enable_fuzzy_query=True,
+            timeout=8,
+            raise_errors=False,
+        )
+
+        quotes = search.quotes or []
+
+    except Exception:
+        return pd.DataFrame(columns=columns)
+
+    records = []
+
+    for quote in quotes:
+
+        if not isinstance(quote, dict):
+            continue
+
+        ticker = str(
+            quote.get("symbol", "")
+        ).strip().upper()
+
+        quote_type = str(
+            quote.get("quoteType", "")
+        ).strip().upper()
+
+        # Only NSE-listed equity shares.
+        if not ticker.endswith(".NS"):
+            continue
+
+        if quote_type and quote_type != "EQUITY":
+            continue
+
+        company_name = (
+            quote.get("longname")
+            or quote.get("shortname")
+            or quote.get("longName")
+            or ticker.replace(".NS", "")
+        )
+
+        records.append({
+            "symbol": ticker.replace(".NS", ""),
+            "company_name": str(company_name),
+            "exchange": "NSE",
+        })
+
+    if not records:
+        return pd.DataFrame(columns=columns)
+
+    result = pd.DataFrame(records)
+
+    result = (
+        result.drop_duplicates(subset="symbol")
+        .reset_index(drop=True)
+    )
+
+    return result[columns]
+
+
+# ============================================================
+# CACHED MARKET DATA
 # ============================================================
 
 @st.cache_data(
@@ -217,11 +308,6 @@ def get_market_data(
     end_date,
     credential_hash,
 ):
-    """
-    Automatically retrieve historical NSE daily candles.
-
-    Successful data is cached for 30 minutes.
-    """
 
     _ = credential_hash
 
@@ -259,50 +345,6 @@ def get_market_data(
 
 
 # ============================================================
-# CACHED COMPANY NAME
-# ============================================================
-
-@st.cache_data(
-    ttl=86400,
-    show_spinner=False,
-)
-def get_company_profile(symbol):
-    """
-    Retrieve the full company name and basic profile.
-
-    Yahoo Finance symbol format:
-        RELIANCE -> RELIANCE.NS
-    """
-
-    import yfinance as yf
-
-    ticker_symbol = (
-        symbol
-        if symbol.endswith(".NS")
-        else f"{symbol}.NS"
-    )
-
-    ticker = yf.Ticker(ticker_symbol)
-
-    info = ticker.get_info()
-
-    if not isinstance(info, dict) or not info:
-        raise ValueError(
-            "Company profile is unavailable."
-        )
-
-    return {
-        "company_name": (
-            info.get("longName")
-            or info.get("shortName")
-            or symbol
-        ),
-        "sector": info.get("sector", "Not available"),
-        "industry": info.get("industry", "Not available"),
-    }
-
-
-# ============================================================
 # CACHED COMPANY FUNDAMENTALS
 # ============================================================
 
@@ -314,10 +356,6 @@ def get_fundamentals(
     symbol,
     market_price,
 ):
-    """
-    Retrieve annual financials and calculate:
-    EPS, P/E, growth, ROE, ROCE, debt and valuation scenarios.
-    """
 
     return fetch_auto_fundamentals(
         symbol=symbol,
@@ -327,87 +365,7 @@ def get_fundamentals(
 
 
 # ============================================================
-# AUTOMATIC AI FORECAST ENGINE
-# ============================================================
-
-@st.cache_data(
-    ttl=21600,
-    show_spinner=False,
-)
-def get_ai_forecasts(feature_df, horizons):
-    """
-    Automatically train eligible models.
-
-    Forecast horizons are processed separately so one failure
-    does not prevent the other horizons from being calculated.
-
-    Returns forecast table, evaluation table and errors.
-    """
-
-    forecast_results = []
-    evaluation_results = []
-    errors = []
-
-    for horizon in horizons:
-
-        try:
-
-            trained = train_forecast_models(
-                feature_df=feature_df,
-                horizons=[horizon],
-            )
-
-            forecast = predict_latest(
-                feature_df=feature_df,
-                trained_models=trained,
-            )
-
-            result = trained[horizon]
-
-            forecast_results.append(forecast)
-
-            evaluation_results.append({
-                "horizon_days": horizon,
-                "directional_accuracy_pct": (
-                    result["directional_accuracy"] * 100
-                ),
-                "validation_rows": result["validation_rows"],
-                "mae": result["mae"],
-            })
-
-        except Exception as exc:
-
-            errors.append(
-                f"{horizon}-day forecast: {exc}"
-            )
-
-    if forecast_results:
-
-        forecasts = pd.concat(
-            forecast_results,
-            ignore_index=True,
-        )
-
-    else:
-
-        forecasts = pd.DataFrame(
-            columns=[
-                "horizon_days",
-                "current_price",
-                "predicted_return_pct",
-                "predicted_price",
-            ]
-        )
-
-    evaluation = pd.DataFrame(
-        evaluation_results
-    )
-
-    return forecasts, evaluation, errors
-
-
-# ============================================================
-# FORMATTING HELPERS
+# FORMATTING
 # ============================================================
 
 def money(value):
@@ -418,7 +376,7 @@ def money(value):
     return f"₹{float(value):,.2f}"
 
 
-def percent(value):
+def percentage(value):
 
     if value is None or pd.isna(value):
         return "N/A"
@@ -426,7 +384,7 @@ def percent(value):
     return f"{float(value):+.2f}%"
 
 
-def ratio(value):
+def multiple(value):
 
     if value is None or pd.isna(value):
         return "N/A"
@@ -435,7 +393,7 @@ def ratio(value):
 
 
 # ============================================================
-# SHORT-TERM TECHNICAL LEVELS
+# SHORT-TERM PRICE LEVELS
 # ============================================================
 
 def calculate_short_term_levels(
@@ -443,10 +401,10 @@ def calculate_short_term_levels(
     feature_df,
 ):
     """
-    Calculate indicative technical levels.
+    Calculate indicative 21-trading-day technical levels.
 
-    Entry zone:
-        Between 20-day low support and SMA 20.
+    Fair entry:
+        Midpoint between 20-day support and SMA 20.
 
     Target 1:
         Entry + 1.5 ATR.
@@ -457,19 +415,18 @@ def calculate_short_term_levels(
     Stop:
         Entry - 1.5 ATR.
 
-    These are technical reference levels, not probability-based
-    forecasts or guaranteed targets.
+    These are technical reference levels, not calibrated
+    probability-based predictions.
     """
 
     if len(feature_df) < 20:
         raise ValueError(
-            "At least 20 daily records are required."
+            "At least 20 trading observations are required."
         )
 
     latest = feature_df.iloc[-1]
 
     sma20 = latest.get("sma_20")
-
     atr = latest.get("atr_14")
 
     if pd.isna(sma20) or pd.isna(atr):
@@ -482,18 +439,18 @@ def calculate_short_term_levels(
             "Invalid moving average or ATR."
         )
 
-    recent = price_df.tail(20)
+    recent_low = pd.to_numeric(
+        price_df.tail(20)["low"],
+        errors="coerce",
+    )
 
     support = float(
-        pd.to_numeric(
-            recent["low"],
-            errors="coerce",
-        ).min()
+        recent_low.min()
     )
 
     if not np.isfinite(support) or support <= 0:
         raise ValueError(
-            "Recent support could not be calculated."
+            "Recent 20-day support is unavailable."
         )
 
     current_price = float(
@@ -524,7 +481,7 @@ def calculate_short_term_levels(
 
     if stop_loss <= 0:
         raise ValueError(
-            "Technical stop level is invalid."
+            "Stop level is outside the valid price range."
         )
 
     if current_price > entry_high:
@@ -534,7 +491,7 @@ def calculate_short_term_levels(
         status = "Inside preferred entry zone"
 
     else:
-        status = "Below recent support area"
+        status = "Below recent support"
 
     return {
         "current_price": current_price,
@@ -545,26 +502,17 @@ def calculate_short_term_levels(
         "target2": target2,
         "stop_loss": stop_loss,
         "entry_status": status,
-        "atr": atr_value,
     }
 
 
 # ============================================================
-# LONG-TERM ENTRY AND CAGR
+# LONG-TERM PRICE LEVELS AND EXPECTED CAGR
 # ============================================================
 
-def calculate_long_term_levels(fundamental_data, current_price):
-    """
-    Calculate five-year Bear/Base/Bull targets.
-
-    Expected CAGR:
-        Calculated from current market price to Base target.
-
-    Fair entry:
-        Base target discounted using a 15% annual return hurdle.
-
-    This is a target-based entry calculation, not a full DCF model.
-    """
+def calculate_long_term_levels(
+    fundamental_data,
+    current_price,
+):
 
     scenarios = fundamental_data["scenarios"]
 
@@ -582,7 +530,7 @@ def calculate_long_term_levels(fundamental_data, current_price):
 
     if base.empty:
         raise ValueError(
-            "The Base valuation scenario is unavailable."
+            "Base valuation scenario is unavailable."
         )
 
     bear_target = (
@@ -607,7 +555,7 @@ def calculate_long_term_levels(fundamental_data, current_price):
         or not np.isfinite(base_target)
     ):
         raise ValueError(
-            "Invalid inputs for long-term valuation."
+            "Invalid long-term valuation inputs."
         )
 
     fair_entry = (
@@ -633,92 +581,206 @@ def calculate_long_term_levels(fundamental_data, current_price):
 
 
 # ============================================================
-# 1. HOMEPAGE HEADER
+# HEADER
 # ============================================================
 
 st.title("📈 StockVision AI")
 
 st.caption(
-    "Intelligent Indian Stock Analysis · Entry Prices · "
-    "Short-Term and Long-Term Targets"
+    "Indian Equity Research · Fair Entry Prices · "
+    "Price Targets · Expected CAGR"
 )
 
 
 # ============================================================
-# 2. SEARCH BAR AT THE TOP
+# SEARCH BAR WITH COMPANY SUGGESTIONS
 # ============================================================
 
-with st.form("stock_search_form"):
+st.subheader("Find a Company")
 
-    search_col, button_col = st.columns(
-        [6, 1]
+search_query = st.text_input(
+    "Search by company name or NSE ticker",
+    placeholder="Type Reliance, Tata, Infosys, HDFC...",
+    key="company_search_query",
+    label_visibility="collapsed",
+)
+
+search_results = search_nse_companies(
+    search_query
+)
+
+selected_symbol = st.session_state["selected_symbol"]
+
+if not search_results.empty:
+
+    # Construct human-readable suggestion labels.
+    labels = {
+        row["symbol"]: (
+            f"{row['company_name']}  ·  "
+            f"{row['symbol']}  ·  NSE"
+        )
+        for _, row in search_results.iterrows()
+    }
+
+    options = search_results["symbol"].tolist()
+
+    matching_index = (
+        options.index(selected_symbol)
+        if selected_symbol in options
+        else None
     )
 
-    with search_col:
+    selected_result = st.selectbox(
+        "Matching NSE companies",
+        options=options,
+        index=matching_index,
+        format_func=lambda ticker: labels.get(
+            ticker,
+            ticker,
+        ),
+        placeholder="Select a company from the suggestions",
+        key=(
+            "company_suggestion_"
+            + hashlib.sha1(
+                search_query.lower().encode()
+            ).hexdigest()[:12]
+        ),
+        label_visibility="collapsed",
+    )
 
-        search_query = st.text_input(
-            "Search NSE Company or Stock Symbol",
-            value=st.session_state["selected_symbol"],
-            placeholder="Example: RELIANCE, TCS, INFY, HDFCBANK",
-        )
+    if selected_result is not None:
 
-    with button_col:
+        if selected_result != selected_symbol:
 
-        st.write("")
-        st.write("")
+            selected_row = search_results[
+                search_results["symbol"] == selected_result
+            ].iloc[0]
 
-        search_clicked = st.form_submit_button(
-            "🔍 Analyse",
-            use_container_width=True,
-        )
+            st.session_state["selected_symbol"] = selected_result
 
+            st.session_state["selected_company_name"] = (
+                selected_row["company_name"]
+            )
 
-if search_clicked:
+            clear_market_state()
 
-    new_symbol = search_query.strip().upper()
+            st.rerun()
 
-    if not re.fullmatch(
-        r"[A-Z0-9&.-]{1,30}",
-        new_symbol,
-    ):
+else:
 
-        st.error(
-            "Enter a valid NSE stock symbol."
+    if len(search_query.strip()) >= 2:
+
+        st.info(
+            "No NSE equity matches found. Try another company name or ticker."
         )
 
     else:
 
-        if new_symbol != st.session_state["selected_symbol"]:
-
-            st.session_state["selected_symbol"] = new_symbol
-
-            clear_stock_data()
-
-            st.rerun()
-
-        else:
-
-            st.session_state["fetch_signature"] = None
-
-            st.rerun()
+        st.caption(
+            f"Currently selected: {selected_symbol}"
+        )
 
 
 symbol = st.session_state["selected_symbol"]
 
 
 # ============================================================
-# 3. SIDEBAR
+# SIDEBAR SETTINGS
 # ============================================================
 
-st.sidebar.title("⚙️ Settings")
+with st.sidebar:
 
-period_label = st.sidebar.selectbox(
-    "Historical Market Data",
-    options=list(PERIOD_OPTIONS.keys()),
-    index=0,
-)
+    st.title("Market Settings")
 
-period_days = PERIOD_OPTIONS[period_label]
+    period_label = st.selectbox(
+        "Historical data range",
+        list(PERIOD_OPTIONS.keys()),
+        index=0,
+    )
+
+    period_days = PERIOD_OPTIONS[period_label]
+
+    refresh = st.button(
+        "↻ Refresh market data",
+        use_container_width=True,
+    )
+
+    with st.expander("Upload historical CSV"):
+
+        uploaded_file = st.file_uploader(
+            "OHLCV CSV",
+            type=["csv"],
+        )
+
+        if st.button("Load CSV"):
+
+            if uploaded_file is None:
+
+                st.warning(
+                    "Select a CSV file first."
+                )
+
+            else:
+
+                try:
+
+                    uploaded = pd.read_csv(
+                        uploaded_file
+                    )
+
+                    required = [
+                        "date",
+                        "open",
+                        "high",
+                        "low",
+                        "close",
+                        "volume",
+                    ]
+
+                    missing = [
+                        c for c in required
+                        if c not in uploaded.columns
+                    ]
+
+                    if missing:
+
+                        st.error(
+                            "Missing columns: "
+                            + ", ".join(missing)
+                        )
+
+                    else:
+
+                        st.session_state["price_data"] = (
+                            uploaded[required].copy()
+                        )
+
+                        st.session_state["active_symbol"] = symbol
+
+                        st.session_state["data_source"] = "CSV Upload"
+
+                        st.session_state["data_error"] = None
+
+                        st.session_state["fetch_signature"] = (
+                            f"CSV|{symbol}"
+                        )
+
+                        st.success(
+                            "Historical data loaded."
+                        )
+
+                        st.rerun()
+
+                except Exception as exc:
+
+                    st.error(
+                        f"CSV error: {exc}"
+                    )
+
+
+# ============================================================
+# AUTOMATIC MARKET DATA FETCH
+# ============================================================
 
 today = INDIA_TODAY
 
@@ -727,95 +789,6 @@ start_date = today - timedelta(
 )
 
 end_date = today
-
-refresh = st.sidebar.button(
-    "↻ Refresh Stock Data",
-    use_container_width=True,
-)
-
-with st.sidebar.expander("Upload Historical CSV"):
-
-    csv_file = st.file_uploader(
-        "OHLCV CSV",
-        type=["csv"],
-        key="market_csv",
-    )
-
-    if st.button("Load CSV"):
-
-        if csv_file is None:
-
-            st.warning(
-                "Please upload a CSV file first."
-            )
-
-        else:
-
-            try:
-
-                uploaded = pd.read_csv(
-                    csv_file
-                )
-
-                required = [
-                    "date",
-                    "open",
-                    "high",
-                    "low",
-                    "close",
-                    "volume",
-                ]
-
-                missing = [
-                    column
-                    for column in required
-                    if column not in uploaded.columns
-                ]
-
-                if missing:
-
-                    st.error(
-                        "Missing columns: "
-                        + ", ".join(missing)
-                    )
-
-                else:
-
-                    st.session_state["price_data"] = (
-                        uploaded[required].copy()
-                    )
-
-                    st.session_state["active_symbol"] = symbol
-
-                    st.session_state["data_source"] = "CSV Upload"
-
-                    st.session_state["data_error"] = None
-
-                    st.session_state["fetch_signature"] = (
-                        f"CSV|{symbol}"
-                    )
-
-                    st.success(
-                        "CSV loaded successfully."
-                    )
-
-            except Exception as exc:
-
-                st.error(
-                    f"CSV loading failed: {exc}"
-                )
-
-
-st.sidebar.divider()
-
-st.sidebar.caption(
-    "Historical price data is cached for 30 minutes."
-)
-
-
-# ============================================================
-# 4. AUTOMATIC MARKET DATA LOADING
-# ============================================================
 
 request_signature = (
     f"{symbol}|{period_days}|{CREDENTIAL_HASH}"
@@ -828,7 +801,6 @@ if refresh:
     st.session_state["fetch_signature"] = None
 
     st.session_state["data_source"] = None
-
 
 if (
     st.session_state["fetch_signature"] != request_signature
@@ -850,14 +822,14 @@ if (
         try:
 
             with st.spinner(
-                f"Loading {symbol} historical prices..."
+                f"Loading {symbol} historical data..."
             ):
 
                 prices = get_market_data(
-                    symbol=symbol,
-                    start_date=start_date.isoformat(),
-                    end_date=end_date.isoformat(),
-                    credential_hash=CREDENTIAL_HASH,
+                    symbol,
+                    start_date.isoformat(),
+                    end_date.isoformat(),
+                    CREDENTIAL_HASH,
                 )
 
             st.session_state["price_data"] = prices
@@ -873,13 +845,13 @@ if (
     else:
 
         st.session_state["data_error"] = (
-            "Kotak API credentials are missing. Configure "
-            "NEO_CONSUMER_KEY in Streamlit Secrets."
+            "Kotak credentials are not configured. "
+            "Add NEO_CONSUMER_KEY in Streamlit Secrets."
         )
 
 
 # ============================================================
-# 5. CHECK MARKET DATA
+# CHECK DATA
 # ============================================================
 
 price_df = st.session_state["price_data"]
@@ -893,19 +865,68 @@ if price_df is None:
 
     st.warning(
         st.session_state["data_error"]
-        or "Historical market data is not available."
+        or "Historical stock data is unavailable."
     )
 
     st.info(
-        "Choose an NSE symbol and configure Kotak Neo credentials. "
-        "StockVision AI will automatically download historical prices."
+        "Select an NSE company and configure Kotak Neo credentials. "
+        "Historical prices are fetched automatically."
     )
 
     st.stop()
 
 
 # ============================================================
-# 6. TECHNICAL FEATURE CALCULATION
+# CLEAN HISTORICAL DATA
+# ============================================================
+
+required_columns = [
+    "date",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+]
+
+price_df = price_df.copy()
+
+price_df["date"] = pd.to_datetime(
+    price_df["date"],
+    errors="coerce",
+)
+
+for column in [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+]:
+
+    price_df[column] = pd.to_numeric(
+        price_df[column],
+        errors="coerce",
+    )
+
+price_df = (
+    price_df.dropna(subset=required_columns)
+    .sort_values("date")
+    .drop_duplicates("date", keep="last")
+    .reset_index(drop=True)
+)
+
+if price_df.empty:
+
+    st.error(
+        "No valid price observations are available."
+    )
+
+    st.stop()
+
+
+# ============================================================
+# FEATURE ENGINEERING
 # ============================================================
 
 try:
@@ -922,11 +943,10 @@ except Exception as exc:
 
     st.stop()
 
-
 if feature_df.empty:
 
     st.error(
-        "No usable historical market observations."
+        "No valid technical indicators could be calculated."
     )
 
     st.stop()
@@ -944,7 +964,7 @@ previous_price = (
     else current_price
 )
 
-daily_change_pct = (
+daily_change = (
     (current_price / previous_price - 1) * 100
     if previous_price > 0
     else 0
@@ -956,59 +976,77 @@ latest_date = pd.to_datetime(
 
 
 # ============================================================
-# 7. COMPANY PROFILE
+# COMPANY PROFILE
 # ============================================================
+
+company_name = st.session_state.get(
+    "selected_company_name",
+    active_symbol,
+)
+
+sector = "Not available"
+industry = "Not available"
 
 try:
 
-    profile = get_company_profile(
-        active_symbol
+    import yfinance as yf
+
+    company_ticker = yf.Ticker(
+        f"{active_symbol}.NS"
     )
 
-    company_name = profile["company_name"]
+    company_info = company_ticker.get_info()
 
-    sector = profile["sector"]
+    company_name = (
+        company_info.get("longName")
+        or company_info.get("shortName")
+        or company_name
+    )
 
-    industry = profile["industry"]
+    sector = company_info.get(
+        "sector",
+        "Not available",
+    )
+
+    industry = company_info.get(
+        "industry",
+        "Not available",
+    )
 
 except Exception:
-
-    company_name = active_symbol
-
-    sector = "Not available"
-
-    industry = "Not available"
+    pass
 
 
 # ============================================================
-# 8. COMPANY NAME AND MARKET SUMMARY
+# COMPANY HEADER
 # ============================================================
 
 st.header(company_name)
 
 st.caption(
-    f"NSE: {active_symbol} · "
-    f"{sector} · "
-    f"{industry}"
+    f"NSE: {active_symbol} · {sector} · {industry}"
 )
 
 st.caption(
-    f"Market data: {st.session_state['data_source']} · "
-    f"Latest available candle: {latest_date:%d %b %Y}"
+    f"Data: {st.session_state['data_source']} · "
+    f"Latest available candle: {latest_date:%d %b %Y} · "
+    f"{len(feature_df):,} daily records"
 )
+
+
+# ============================================================
+# CURRENT MARKET SUMMARY
+# ============================================================
 
 a, b, c, d = st.columns(4)
 
 a.metric(
     "Current Price",
     money(current_price),
-    percent(daily_change_pct),
+    percentage(daily_change),
 )
 
-rsi = latest.get(
-    "rsi_14",
-    np.nan,
-)
+rsi = latest.get("rsi_14", np.nan)
 
 b.metric(
     "RSI (14)",
@@ -1021,7 +1059,7 @@ c.metric(
 )
 
 d.metric(
-    "Trading Records",
+    "Historical Records",
     f"{len(feature_df):,}",
 )
 
@@ -1029,11 +1067,10 @@ st.divider()
 
 
 # ============================================================
-# 9. AUTOMATIC SHORT-TERM PRICE LEVELS
+# AUTOMATIC SHORT-TERM LEVELS
 # ============================================================
 
 short_levels = None
-
 short_error = None
 
 try:
@@ -1049,19 +1086,17 @@ except Exception as exc:
 
 
 # ============================================================
-# 10. AUTOMATIC FUNDAMENTALS
+# AUTOMATIC LONG-TERM FUNDAMENTALS
 # ============================================================
 
 fundamentals = None
-
 long_levels = None
-
 fundamental_error = None
 
 try:
 
     with st.spinner(
-        f"Calculating {active_symbol} long-term valuation..."
+        f"Calculating {active_symbol} fundamental valuation..."
     ):
 
         fundamentals = get_fundamentals(
@@ -1080,29 +1115,29 @@ except Exception as exc:
 
 
 # ============================================================
-# 11. MAIN PRICE LEVEL DASHBOARD
+# MAIN INVESTMENT DASHBOARD
 # ============================================================
 
 st.header("🎯 Fair Entry Prices & Targets")
 
 st.caption(
-    "Automatically calculated from current technical indicators "
-    "and retrieved company financial statements."
+    "Automatically calculated short-term technical levels "
+    "and long-term fundamental valuation."
 )
-
-
-# ============================================================
-# SHORT-TERM PRICE CARD
-# ============================================================
 
 short_col, long_col = st.columns(2)
 
+
+# ============================================================
+# SHORT-TERM CARD
+# ============================================================
+
 with short_col:
 
-    st.subheader("⚡ Short-Term Outlook")
+    st.subheader("⚡ Short Term")
 
     st.caption(
-        "Technical levels · Approx. 21 trading days"
+        "21 Trading Days · Technical Scenario"
     )
 
     if short_levels is not None:
@@ -1122,26 +1157,26 @@ with short_col:
             f"{money(short_levels['entry_high'])}"
         )
 
-        x, y = st.columns(2)
+        a, b = st.columns(2)
 
-        x.metric(
+        a.metric(
             "Target 1",
             money(short_levels["target1"]),
         )
 
-        y.metric(
+        b.metric(
             "Target 2",
             money(short_levels["target2"]),
         )
 
         st.metric(
-            "Risk / Stop-Loss Level",
+            "Stop-Loss Reference",
             money(short_levels["stop_loss"]),
         )
 
         st.caption(
-            "Entry is based on 20-day support and SMA 20. "
-            "Targets and stop-loss use ATR multiples."
+            "Based on 20-day support, SMA 20 and ATR 14. "
+            "These are technical reference levels, not AI price predictions."
         )
 
     else:
@@ -1152,62 +1187,55 @@ with short_col:
 
 
 # ============================================================
-# LONG-TERM PRICE CARD
+# LONG-TERM CARD
 # ============================================================
 
 with long_col:
 
-    st.subheader("🏦 Long-Term Outlook")
+    st.subheader("🏦 Long Term")
 
     st.caption(
-        "Five-year fundamental valuation"
+        "5 Years · Automatic Fundamental Valuation"
     )
 
     if long_levels is not None:
 
         st.metric(
-            "Fair Entry Price",
+            "Indicative Fair Entry",
             money(long_levels["fair_entry"]),
-            "15% annual return hurdle",
+            f"{long_levels['required_return_pct']:.0f}% "
+            "annual return hurdle",
         )
 
         st.metric(
             "Expected Base-Case CAGR",
-            percent(long_levels["expected_cagr_pct"]),
-            "Based on current market price",
+            percentage(
+                long_levels["expected_cagr_pct"]
+            ),
+            "From current market price",
         )
 
-        x, y, z = st.columns(3)
+        a, b, c = st.columns(3)
 
-        x.metric(
+        a.metric(
             "Bear Target",
             money(long_levels["bear_target"]),
         )
 
-        y.metric(
+        b.metric(
             "Base Target",
             money(long_levels["base_target"]),
         )
 
-        z.metric(
+        c.metric(
             "Bull Target",
             money(long_levels["bull_target"]),
-        )
-
-        current_vs_entry = (
-            (current_price / long_levels["fair_entry"]) - 1
-        ) * 100
-
-        st.caption(
-            f"Current price is {current_vs_entry:+.2f}% "
-            "relative to the calculated fair-entry level."
         )
 
     else:
 
         st.warning(
-            "Long-term valuation unavailable. "
-            "Verified financial data is needed."
+            "Long-term valuation is unavailable."
         )
 
         st.caption(
@@ -1216,7 +1244,7 @@ with long_col:
 
 
 # ============================================================
-# 12. PRICE COMPARISON CHART
+# PRICE LEVEL COMPARISON
 # ============================================================
 
 if short_levels is not None or long_levels is not None:
@@ -1237,17 +1265,17 @@ if short_levels is not None or long_levels is not None:
 
         price_levels.extend([
             {
-                "Level": "Short-Term Entry",
+                "Level": "Short Entry",
                 "Price": short_levels["fair_entry"],
                 "Category": "Short Term",
             },
             {
-                "Level": "Short Target 1",
+                "Level": "Target 1",
                 "Price": short_levels["target1"],
                 "Category": "Short Term",
             },
             {
-                "Level": "Short Target 2",
+                "Level": "Target 2",
                 "Price": short_levels["target2"],
                 "Category": "Short Term",
             },
@@ -1257,33 +1285,33 @@ if short_levels is not None or long_levels is not None:
 
         price_levels.extend([
             {
-                "Level": "Long-Term Entry",
+                "Level": "Long Entry",
                 "Price": long_levels["fair_entry"],
                 "Category": "Long Term",
             },
             {
-                "Level": "Five-Year Base Target",
+                "Level": "Five-Year Base",
                 "Price": long_levels["base_target"],
                 "Category": "Long Term",
             },
         ])
 
-    comparison_df = pd.DataFrame(
+    comparison = pd.DataFrame(
         price_levels
     )
 
-    price_chart = px.bar(
-        comparison_df,
+    chart = px.bar(
+        comparison,
         x="Level",
         y="Price",
         color="Category",
         title=f"{active_symbol} Price Levels",
     )
 
-    price_chart.update_layout(
-        height=350,
-        yaxis_title="Price (₹)",
+    chart.update_layout(
+        height=340,
         xaxis_title="",
+        yaxis_title="Price (₹)",
         margin=dict(
             l=5,
             r=5,
@@ -1293,125 +1321,13 @@ if short_levels is not None or long_levels is not None:
     )
 
     st.plotly_chart(
-        price_chart,
+        chart,
         use_container_width=True,
     )
 
 
 # ============================================================
-# 13. AUTOMATIC AI FORECASTING
-# ============================================================
-
-with st.expander(
-    "🤖 AI Forecast Outlook",
-    expanded=False,
-):
-
-    st.caption(
-        "Eligible models are trained automatically. "
-        "No manual training controls are required."
-    )
-
-    # Approximate minimum dataset sizes for this project's
-    # current 200-day moving-average and validation requirements.
-    eligible_horizons = [
-        horizon
-        for horizon, minimum_rows in [
-            (21, 450),
-            (63, 550),
-            (126, 700),
-            (252, 1050),
-        ]
-        if len(feature_df) >= minimum_rows
-    ]
-
-    if not eligible_horizons:
-
-        st.info(
-            f"Currently loaded: {len(feature_df)} records. "
-            "More history is needed for reliable model training. "
-            "Choose a longer historical range in the sidebar."
-        )
-
-    else:
-
-        try:
-
-            with st.spinner(
-                "Generating AI price estimates..."
-            ):
-
-                forecasts, evaluation, forecast_errors = (
-                    get_ai_forecasts(
-                        feature_df,
-                        tuple(eligible_horizons),
-                    )
-                )
-
-            if not forecasts.empty:
-
-                st.subheader(
-                    "AI-Estimated Future Prices"
-                )
-
-                forecast_columns = st.columns(
-                    min(len(forecasts), 4)
-                )
-
-                for column, (_, row) in zip(
-                    forecast_columns,
-                    forecasts.iterrows(),
-                ):
-
-                    with column:
-
-                        st.metric(
-                            f"{int(row['horizon_days'])}-Day Estimate",
-                            money(row["predicted_price"]),
-                            percent(row["predicted_return_pct"]),
-                        )
-
-                st.subheader(
-                    "Historical Model Evaluation"
-                )
-
-                st.dataframe(
-                    evaluation.rename(
-                        columns={
-                            "horizon_days": "Horizon (Days)",
-                            "directional_accuracy_pct": "Directional Accuracy (%)",
-                            "validation_rows": "Validation Records",
-                            "mae": "Mean Absolute Error",
-                        }
-                    ).style.format({
-                        "Directional Accuracy (%)": "{:.2f}%",
-                        "Mean Absolute Error": "{:.5f}",
-                    }),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-                st.caption(
-                    "Historical directional accuracy is not the "
-                    "probability of a profitable future trade."
-                )
-
-            if forecast_errors:
-
-                with st.expander("Forecast availability details"):
-
-                    for error in forecast_errors:
-                        st.caption(error)
-
-        except Exception as exc:
-
-            st.info(
-                f"AI forecast calculations are unavailable: {exc}"
-            )
-
-
-# ============================================================
-# 14. COMPANY FUNDAMENTALS
+# FUNDAMENTAL HEALTH
 # ============================================================
 
 with st.expander(
@@ -1428,7 +1344,8 @@ with st.expander(
         )
 
         st.caption(
-            "Annual company financial information"
+            f"Latest financial year: "
+            f"{fundamentals['latest_fiscal_year']}"
         )
 
         a, b, c, d = st.columns(4)
@@ -1440,82 +1357,80 @@ with st.expander(
 
         b.metric(
             "P/E",
-            ratio(metrics["pe_ratio"]),
+            multiple(metrics["pe_ratio"]),
         )
 
         c.metric(
             "Revenue CAGR",
-            percent(metrics["revenue_growth_pct"]),
+            percentage(metrics["revenue_growth_pct"]),
         )
 
         d.metric(
             "EPS CAGR",
-            percent(metrics["eps_growth_pct"]),
+            percentage(metrics["eps_growth_pct"]),
         )
 
         a, b, c, d = st.columns(4)
 
         a.metric(
             "ROE",
-            percent(metrics["roe_pct"]),
+            percentage(metrics["roe_pct"]),
         )
 
         b.metric(
             "ROCE",
-            percent(metrics["roce_pct"]),
+            percentage(metrics["roce_pct"]),
         )
 
         c.metric(
             "Operating Margin",
-            percent(metrics["operating_margin_pct"]),
+            percentage(metrics["operating_margin_pct"]),
         )
 
         d.metric(
             "Net Profit Margin",
-            percent(metrics["net_profit_margin_pct"]),
+            percentage(metrics["net_profit_margin_pct"]),
         )
 
         a, b = st.columns(2)
 
         a.metric(
             "Debt / Equity",
-            ratio(metrics["debt_to_equity"]),
+            multiple(metrics["debt_to_equity"]),
         )
 
         b.metric(
             "Current Ratio",
-            ratio(metrics["current_ratio"]),
+            multiple(metrics["current_ratio"]),
         )
 
         with st.expander("Annual Financial History"):
 
-            history = fundamentals["financial_history"]
-
             st.dataframe(
-                history,
+                fundamentals["financial_history"],
                 use_container_width=True,
                 hide_index=True,
             )
 
-        with st.expander("Valuation Methodology"):
+        with st.expander("Valuation Assumptions"):
 
             st.write(
                 fundamentals["assumptions"]
             )
 
-            st.write(
+            st.caption(
                 f"EPS source: {metrics['eps_source']}"
             )
 
-            st.write(
-                f"Financial data source: {fundamentals['source']}"
+            st.caption(
+                f"Data source: {fundamentals['source']}"
             )
 
     else:
 
         st.info(
-            "Financial statements are not currently available "
-            "for this company. No financial values have been invented."
+            "Fundamental data is unavailable for this company. "
+            "No financial values are fabricated."
         )
 
         if fundamental_error:
@@ -1523,45 +1438,43 @@ with st.expander(
 
 
 # ============================================================
-# 15. TECHNICAL ANALYSIS
+# TECHNICAL ANALYSIS
 # ============================================================
 
 with st.expander(
-    "📊 Detailed Technical Analysis",
+    "📊 Technical Analysis",
     expanded=False,
 ):
 
     chart_columns = [
-        column
-        for column in [
+        c for c in [
             "close",
             "sma_20",
             "sma_50",
             "sma_200",
         ]
-        if column == "close"
+        if c == "close"
         or (
-            column in feature_df.columns
-            and feature_df[column].notna().any()
+            c in feature_df.columns
+            and feature_df[c].notna().any()
         )
     ]
 
-    chart = px.line(
+    price_chart = px.line(
         feature_df,
         x="date",
         y=chart_columns,
-        title=f"{active_symbol} Price and Moving Averages",
+        title=f"{active_symbol} Price Trend",
     )
 
-    chart.update_layout(
+    price_chart.update_layout(
         height=400,
         hovermode="x unified",
         yaxis_title="Price (₹)",
-        legend_title_text="",
     )
 
     st.plotly_chart(
-        chart,
+        price_chart,
         use_container_width=True,
     )
 
@@ -1617,7 +1530,7 @@ with st.expander(
         )
 
         b.metric(
-            "Score",
+            "Technical Score",
             f"{signal['score']:+.1f}/100",
         )
 
@@ -1640,7 +1553,7 @@ with st.expander(
 
 
 # ============================================================
-# 16. AUTOMATIC RISK ANALYSIS
+# HISTORICAL RISK
 # ============================================================
 
 with st.expander(
@@ -1660,12 +1573,12 @@ with st.expander(
 
         a.metric(
             "Annual Volatility",
-            percent(risk["annualized_volatility_pct"]),
+            percentage(risk["annualized_volatility_pct"]),
         )
 
         b.metric(
             "Maximum Drawdown",
-            percent(risk["maximum_drawdown_pct"]),
+            percentage(risk["maximum_drawdown_pct"]),
         )
 
         c.metric(
@@ -1679,48 +1592,22 @@ with st.expander(
 
         d.metric(
             "Daily VaR",
-            percent(risk["daily_var_pct"]),
-        )
-
-        a, b, c = st.columns(3)
-
-        a.metric(
-            "Sortino Ratio",
-            (
-                f"{risk['sortino_ratio']:.2f}"
-                if pd.notna(risk["sortino_ratio"])
-                else "N/A"
-            ),
-        )
-
-        b.metric(
-            "Conditional VaR",
-            percent(risk["daily_cvar_pct"]),
-        )
-
-        c.metric(
-            "Historical Return",
-            percent(risk["annualized_return_pct"]),
-        )
-
-        st.caption(
-            "Backward-looking risk measurements are not guarantees "
-            "of future gains or maximum losses."
+            percentage(risk["daily_var_pct"]),
         )
 
     except Exception as exc:
 
         st.warning(
-            f"Risk calculations unavailable: {exc}"
+            f"Risk analysis unavailable: {exc}"
         )
 
 
 # ============================================================
-# 17. WATCHLIST
+# WATCHLIST
 # ============================================================
 
 with st.expander(
-    "⭐ Watchlist",
+    "⭐ Watchlist & Multi-Stock Scanner",
     expanded=False,
 ):
 
@@ -1735,8 +1622,7 @@ with st.expander(
         )
 
         add_clicked = st.form_submit_button(
-            "Add Stock",
-            use_container_width=True,
+            "Add to Watchlist",
         )
 
     if add_clicked:
@@ -1759,7 +1645,7 @@ with st.expander(
     if watchlist.empty:
 
         st.info(
-            "No stocks have been added yet."
+            "Your watchlist is empty."
         )
 
     else:
@@ -1771,7 +1657,7 @@ with st.expander(
         )
 
         remove_choice = st.selectbox(
-            "Remove stock",
+            "Remove a stock",
             [""] + watchlist["symbol"].tolist(),
             key="watchlist_remove",
         )
@@ -1792,8 +1678,6 @@ with st.expander(
 
                     st.error(str(exc))
 
-        st.divider()
-
         if st.button(
             "Scan Watchlist",
             type="primary",
@@ -1802,7 +1686,7 @@ with st.expander(
             if not HAS_KOTAK_KEY:
 
                 st.warning(
-                    "Kotak credentials are required for the scanner."
+                    "Kotak API access is required for scanning."
                 )
 
             else:
@@ -1810,7 +1694,7 @@ with st.expander(
                 try:
 
                     with st.spinner(
-                        "Analysing watchlist..."
+                        "Scanning NSE stocks..."
                     ):
 
                         client = create_neo_client()
@@ -1831,14 +1715,14 @@ with st.expander(
                 except Exception as exc:
 
                     st.error(
-                        f"Watchlist scan failed: {exc}"
+                        f"Scanner failed: {exc}"
                     )
 
         results = st.session_state["scanner_results"]
 
         if results is not None:
 
-            st.subheader("Watchlist Scan Results")
+            st.subheader("Watchlist Results")
 
             st.dataframe(
                 results,
@@ -1846,48 +1730,38 @@ with st.expander(
                 hide_index=True,
             )
 
-            st.download_button(
-                "Download Scanner CSV",
-                data=results.to_csv(
-                    index=False
-                ).encode("utf-8"),
-                file_name="stockvision_watchlist.csv",
-                mime="text/csv",
-            )
-
 
 # ============================================================
-# 18. TRANSPARENCY AND DISCLAIMER
+# METHODOLOGY AND DISCLAIMER
 # ============================================================
 
 with st.expander(
-    "How StockVision calculates entry prices and targets",
+    "How StockVision calculates price levels",
 ):
 
     st.markdown(
         """
-        **Short-term entry:** Midpoint between 20-day price support
-        and the 20-day simple moving average.
+        **Short-term entry:** The midpoint between recent 20-day
+        price support and the 20-day simple moving average.
 
-        **Short-term targets:** ATR multiples above the entry reference.
-        These are technical scenario levels, not guaranteed forecasts.
+        **Short-term targets:** ATR-based technical scenarios
+        over approximately 21 trading days.
 
-        **Long-term targets:** Five-year EPS growth and future P/E
-        scenarios using company financial statements.
+        **Long-term entry:** The five-year Base-case target
+        discounted at a 15% annual required-return hurdle.
 
-        **Long-term fair entry:** Five-year Base target discounted
-        using a 15% annual required return.
+        **Expected CAGR:** Annualized return implied by the
+        five-year Base target compared with today's market price.
 
-        **Expected CAGR:** Annualized return implied by the five-year
-        Base target relative to today's market price.
+        **Long-term targets:** Derived from historical financial
+        growth and Bear/Base/Bull future P/E assumptions.
         """
     )
 
     st.caption(
-        "Yahoo Finance data is unofficial and may be delayed, "
-        "incomplete or unavailable. Short-term technical levels "
-        "and long-term valuation scenarios are estimates, not "
-        "guaranteed price targets or personalized investment advice."
+        "These calculations are estimates, not guaranteed price "
+        "targets or personalized investment advice. Yahoo Finance "
+        "data is unofficial and may be incomplete or delayed."
     )
 
 
@@ -1898,6 +1772,6 @@ with st.expander(
 st.divider()
 
 st.caption(
-    "StockVision AI · Research and analysis platform · "
-    "All entry prices, target prices and expected returns are estimates."
+    "StockVision AI · Indian Equities Research · "
+    "Indicative estimates only."
 )
