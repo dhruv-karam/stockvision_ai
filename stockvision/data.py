@@ -1,5 +1,9 @@
 
 import os
+import json
+import time
+import threading
+
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -14,10 +18,31 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 INSTRUMENTS_FILE = PROJECT_ROOT / "instruments.csv"
-
 DATA_DIR = PROJECT_ROOT / "data"
 
 load_dotenv(PROJECT_ROOT / ".env")
+
+# Conservative spacing between historical API requests.
+# Override through environment variable if required.
+HISTORICAL_REQUEST_GAP = max(
+    1.0,
+    float(os.getenv("KOTAK_HISTORICAL_REQUEST_GAP", "5"))
+)
+
+_last_historical_request = None
+_request_lock = threading.Lock()
+
+
+# ==================================================
+# CUSTOM RATE-LIMIT ERROR
+# ==================================================
+
+class KotakRateLimitError(RuntimeError):
+    """Raised when Kotak Neo rejects a request due to rate limiting."""
+
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 # ==================================================
@@ -28,8 +53,10 @@ def create_neo_client():
     """
     Create Kotak Neo API client.
 
-    Consumer key is loaded from the local .env file
-    or from environment variables supplied by Streamlit Cloud.
+    Reads the consumer key from:
+    - Local .env file
+    - Environment variables
+    - Streamlit Cloud Secrets copied into environment variables
     """
 
     consumer_key = os.getenv("NEO_CONSUMER_KEY")
@@ -38,7 +65,7 @@ def create_neo_client():
     if not consumer_key or not consumer_key.strip():
         raise ValueError(
             "Kotak Neo consumer key is missing. "
-            "Add NEO_CONSUMER_KEY to your local .env file "
+            "Configure NEO_CONSUMER_KEY in your local .env "
             "or Streamlit Cloud Secrets."
         )
 
@@ -55,7 +82,7 @@ def create_neo_client():
     except ImportError as exc:
         raise ImportError(
             "Kotak Neo SDK is not installed. "
-            "Install dependencies using requirements.txt."
+            "Install dependencies from requirements.txt."
         ) from exc
 
     return NeoAPI(
@@ -73,12 +100,12 @@ def get_instrument_symbol(
     instruments_file=INSTRUMENTS_FILE
 ):
     """
-    Read the verified exchange segment and instrument token.
+    Retrieve the verified Kotak Neo exchange and token.
 
     Example:
-        RELIANCE -> nse_cm|1333
+        RELIANCE -> nse_cm|2885
 
-    Never guess instrument tokens.
+    The token is read from instruments.csv.
     """
 
     symbol = str(symbol).strip().upper()
@@ -126,13 +153,12 @@ def get_instrument_symbol(
     if matches.empty:
         raise ValueError(
             f"{symbol} was not found in instruments.csv. "
-            "Use the NSE instrument lookup feature first."
+            "Use the instrument lookup feature first."
         )
 
     if len(matches) > 1:
         raise ValueError(
-            f"Multiple instruments found for {symbol}. "
-            "Keep one verified NSE equity record."
+            f"Multiple instrument records found for {symbol}."
         )
 
     row = matches.iloc[0]
@@ -153,11 +179,6 @@ def get_instrument_symbol(
     exchange = str(exchange_raw).strip()
     token = str(token_raw).strip()
 
-    if token.lower() in {"nan", "none", "null"}:
-        raise ValueError(
-            f"Invalid instrument token for {symbol}."
-        )
-
     if not token.isdigit() or int(token) <= 0:
         raise ValueError(
             f"Invalid instrument token for {symbol}: {token}"
@@ -171,7 +192,7 @@ def get_instrument_symbol(
 # ==================================================
 
 def _convert_date(value):
-    """Convert input to a Python date object."""
+    """Convert input to Python date."""
 
     if isinstance(value, datetime):
         return value.date()
@@ -189,98 +210,315 @@ def _convert_date(value):
 
 
 # ==================================================
-# API ERROR EXTRACTION
+# NORMALIZE RESPONSE OBJECT
 # ==================================================
 
-def _extract_api_error(response):
+def _to_dict(value):
     """
-    Extract useful error messages from Kotak responses.
+    Convert a response body or exception body into a dictionary
+    when possible.
+    """
 
-    Supports:
-        status / fault
-        stat / error
-        errMsg / emsg / desc
+    if isinstance(value, dict):
+        return value
+
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+
+            if isinstance(parsed, dict):
+                return parsed
+
+        except (ValueError, TypeError):
+            pass
+
+    return None
+
+
+def _response_dicts(source):
+    """Collect available dictionaries from responses and exceptions."""
+
+    if source is None:
+        return []
+
+    result = []
+
+    if isinstance(source, dict):
+        result.append(source)
+
+    for attribute in (
+        "body",
+        "response_body",
+        "detail",
+    ):
+        value = getattr(source, attribute, None)
+        parsed = _to_dict(value)
+
+        if parsed is not None:
+            result.append(parsed)
+
+    response = getattr(source, "response", None)
+
+    if response is not None:
+
+        for attribute in ("body", "text"):
+            value = getattr(response, attribute, None)
+
+            parsed = _to_dict(value)
+
+            if parsed is not None:
+                result.append(parsed)
+
+        try:
+            parsed = _to_dict(response.json())
+
+            if parsed is not None:
+                result.append(parsed)
+
+        except Exception:
+            pass
+
+    parsed = _to_dict(source)
+
+    if parsed is not None:
+        result.append(parsed)
+
+    return result
+
+
+# ==================================================
+# RATE LIMIT DETECTION
+# ==================================================
+
+def _is_rate_limit_error(source):
+    """Detect Kotak HTTP 429 responses and rate-limit messages."""
+
+    if source is None:
+        return False
+
+    # Check exception attributes.
+    for attribute in (
+        "status",
+        "status_code",
+        "code",
+    ):
+        value = getattr(source, attribute, None)
+
+        try:
+            if int(value) == 429:
+                return True
+        except (TypeError, ValueError):
+            pass
+
+    # Check response dictionaries.
+    for item in _response_dicts(source):
+
+        for key in (
+            "code",
+            "status_code",
+            "stCode",
+        ):
+            try:
+                if int(item.get(key)) == 429:
+                    return True
+            except (TypeError, ValueError):
+                pass
+
+    message = str(source).lower()
+
+    rate_limit_phrases = [
+        "rate limit exceeded",
+        "too many requests",
+        "too many request received",
+        "status_code': 429",
+        '"status_code": 429',
+    ]
+
+    return any(
+        phrase in message
+        for phrase in rate_limit_phrases
+    )
+
+
+# ==================================================
+# RETRY-AFTER EXTRACTION
+# ==================================================
+
+def _get_retry_after_seconds(source):
     """
+    Read Retry-After from Kotak rateLimit metadata or HTTP headers.
+
+    Returns None when the API does not provide a usable value.
+    """
+
+    for item in _response_dicts(source):
+
+        # Kotak SDK exposes these headers under rateLimit.
+        rate_limit = item.get("rateLimit")
+
+        if isinstance(rate_limit, dict):
+
+            for key, value in rate_limit.items():
+
+                if str(key).lower() in {
+                    "retry-after",
+                    "x-ratelimit-reset",
+                }:
+
+                    try:
+                        seconds = float(value)
+
+                        if seconds > 0:
+                            return int(seconds)
+
+                    except (TypeError, ValueError):
+                        continue
+
+    # Check exception or response HTTP headers.
+    possible_headers = []
+
+    headers = getattr(source, "headers", None)
+
+    if isinstance(headers, dict):
+        possible_headers.append(headers)
+
+    response = getattr(source, "response", None)
+
+    if response is not None:
+        response_headers = getattr(
+            response,
+            "headers",
+            None
+        )
+
+        if response_headers is not None:
+            possible_headers.append(response_headers)
+
+    for header_set in possible_headers:
+
+        for key, value in header_set.items():
+
+            if str(key).lower() == "retry-after":
+
+                try:
+                    seconds = float(value)
+
+                    if seconds > 0:
+                        return int(seconds)
+
+                except (TypeError, ValueError):
+                    continue
+
+    return None
+
+
+# ==================================================
+# API ERROR MESSAGE
+# ==================================================
+
+def _extract_api_error(source):
+    """Extract a useful error message from Kotak API responses."""
 
     messages = []
 
-    fault = response.get("fault")
+    for item in _response_dicts(source):
 
-    if isinstance(fault, dict):
+        error = item.get("error")
 
-        message = fault.get("message")
-        code = fault.get("code")
+        if isinstance(error, list):
 
-        if message:
-            messages.append(str(message))
+            for entry in error:
 
-        if code:
-            messages.append(f"Error code: {code}")
+                if isinstance(entry, dict):
 
-    elif fault:
-        messages.append(str(fault))
+                    if entry.get("message"):
+                        messages.append(str(entry["message"]))
 
-    errors = response.get("error")
+                    if entry.get("code"):
+                        messages.append(
+                            f"Error code: {entry['code']}"
+                        )
 
-    if isinstance(errors, list):
+                elif entry:
+                    messages.append(str(entry))
 
-        for item in errors:
+        elif isinstance(error, dict):
 
-            if isinstance(item, dict):
+            if error.get("message"):
+                messages.append(str(error["message"]))
 
-                message = item.get("message")
-                code = item.get("code")
+            if error.get("code"):
+                messages.append(
+                    f"Error code: {error['code']}"
+                )
 
-                if message:
-                    messages.append(str(message))
+        elif error:
+            messages.append(str(error))
 
-                if code:
-                    messages.append(f"Error code: {code}")
+        fault = item.get("fault")
 
-            elif item:
-                messages.append(str(item))
+        if isinstance(fault, dict):
 
-    elif isinstance(errors, dict):
+            if fault.get("message"):
+                messages.append(str(fault["message"]))
 
-        message = errors.get("message")
-        code = errors.get("code")
+            if fault.get("code"):
+                messages.append(
+                    f"Error code: {fault['code']}"
+                )
 
-        if message:
-            messages.append(str(message))
+        for key in (
+            "message",
+            "errMsg",
+            "emsg",
+            "desc",
+        ):
+            if item.get(key):
+                messages.append(str(item[key]))
 
-        if code:
-            messages.append(f"Error code: {code}")
+    if messages:
+        return "; ".join(dict.fromkeys(messages))
 
-    elif errors:
-        messages.append(str(errors))
+    return str(source)
 
-    for key in (
-        "errMsg",
-        "emsg",
-        "desc",
-        "message",
-    ):
 
-        value = response.get(key)
+# ==================================================
+# REQUEST PACING
+# ==================================================
 
-        if value:
-            messages.append(str(value))
+def _wait_for_request_slot():
+    """
+    Ensure historical requests are separated by the configured gap.
 
-    code = (
-        response.get("stCode")
-        or response.get("code")
-    )
+    This is process-local pacing, not a guarantee against
+    account-wide or provider-side rate limits.
+    """
 
-    if code:
-        messages.append(f"Status code: {code}")
+    global _last_historical_request
 
-    if not messages:
-        messages.append(
-            "No detailed error message was supplied. "
-            f"Response fields: {list(response.keys())}"
-        )
+    with _request_lock:
 
-    return "; ".join(dict.fromkeys(messages))
+        if _last_historical_request is not None:
+
+            elapsed = (
+                time.monotonic()
+                - _last_historical_request
+            )
+
+            remaining = HISTORICAL_REQUEST_GAP - elapsed
+
+            if remaining > 0:
+                print(
+                    f"Waiting {remaining:.1f} seconds "
+                    "before next Kotak historical request."
+                )
+
+                time.sleep(remaining)
+
+        _last_historical_request = time.monotonic()
 
 
 # ==================================================
@@ -289,24 +527,14 @@ def _extract_api_error(response):
 
 def _parse_candles(response):
     """
-    Parse Kotak Neo historical candle response.
+    Parse Kotak Neo historical candles.
 
-    Supports:
+    Supported success responses:
         status = success
-
-    And:
         stat = Ok
 
-    Candle format:
-        [
-            timestamp,
-            open,
-            high,
-            low,
-            close,
-            volume,
-            open_interest
-        ]
+    Candle layout:
+        timestamp, open, high, low, close, volume, open_interest
     """
 
     columns = [
@@ -315,13 +543,22 @@ def _parse_candles(response):
         "high",
         "low",
         "close",
-        "volume"
+        "volume",
     ]
 
     if not isinstance(response, dict):
         raise RuntimeError(
             "Unexpected Kotak response type: "
             f"{type(response).__name__}"
+        )
+
+    if _is_rate_limit_error(response):
+        retry_after = _get_retry_after_seconds(response)
+
+        raise KotakRateLimitError(
+            "Kotak Neo rejected the historical request with HTTP 429. "
+            "Please wait before requesting more data.",
+            retry_after=retry_after,
         )
 
     status = str(
@@ -332,50 +569,30 @@ def _parse_candles(response):
         response.get("stat", "")
     ).strip().lower()
 
-    successful_statuses = {
-        "success",
-        "ok",
-    }
-
-    failed_statuses = {
-        "error",
-        "not_ok",
-        "failed",
-        "failure",
-    }
-
-    # Accept both documented success fields.
-    is_success = (
-        status in successful_statuses
-        or stat in successful_statuses
+    success = (
+        status in {"success", "ok"}
+        or stat in {"ok", "success"}
     )
 
-    # Explicit errors must never be treated as success.
-    explicit_failure = (
-        status in failed_statuses
-        or stat in failed_statuses
-    )
-
-    if explicit_failure or not is_success:
-
-        message = _extract_api_error(response)
+    if not success:
 
         raise RuntimeError(
-            f"Kotak Neo historical API error: {message}"
+            "Kotak Neo historical API error: "
+            + _extract_api_error(response)
         )
 
     data = response.get("data", {})
 
     if not isinstance(data, dict):
         raise RuntimeError(
-            "Kotak Neo returned an unexpected data structure."
+            "Kotak returned an unexpected historical data structure."
         )
 
     candles = data.get("candles", [])
 
     if not isinstance(candles, list):
         raise RuntimeError(
-            "Historical candles were not returned as a list."
+            "Kotak historical candles are not in list format."
         )
 
     if not candles:
@@ -402,13 +619,12 @@ def _parse_candles(response):
 
     if not records:
         raise RuntimeError(
-            "Kotak returned candles, but their OHLCV format "
-            "was not recognised."
+            "Kotak returned candles, but the OHLCV format "
+            "could not be recognised."
         )
 
     df = pd.DataFrame(records)
 
-    # Convert timestamps to Indian market time.
     df["date"] = (
         pd.to_datetime(
             df["date"],
@@ -424,20 +640,18 @@ def _parse_candles(response):
         "high",
         "low",
         "close",
-        "volume"
+        "volume",
     ]
 
     for column in numeric_columns:
+
         df[column] = pd.to_numeric(
             df[column],
             errors="coerce"
         )
 
-    df = df.dropna(
-        subset=columns
-    )
+    df = df.dropna(subset=columns)
 
-    # Remove invalid OHLCV records.
     df = df[
         (df["open"] > 0)
         & (df["high"] > 0)
@@ -465,19 +679,19 @@ def fetch_daily_history(
     start_date,
     end_date,
     client=None,
-    instruments_file=INSTRUMENTS_FILE
+    instruments_file=INSTRUMENTS_FILE,
 ):
     """
-    Download daily OHLCV data from Kotak Neo.
+    Fetch daily historical OHLCV data from Kotak Neo.
 
-    Daily interval:
-        D
+    Maximum request period:
+        180 calendar days per request.
 
-    Maximum request window:
-        180 calendar days
+    Requests are spaced using HISTORICAL_REQUEST_GAP.
 
-    Longer periods are automatically split into
-    multiple requests.
+    IMPORTANT:
+        On HTTP 429, this function stops immediately.
+        It does not automatically retry and create more API traffic.
     """
 
     symbol = str(symbol).strip().upper()
@@ -498,7 +712,7 @@ def fetch_daily_history(
 
     neo_symbol = get_instrument_symbol(
         symbol=symbol,
-        instruments_file=instruments_file
+        instruments_file=instruments_file,
     )
 
     all_data = []
@@ -507,10 +721,10 @@ def fetch_daily_history(
 
     while current_start <= end_date:
 
-        # Maximum 180 calendar days inclusive.
+        # 180 calendar days inclusive.
         current_end = min(
             current_start + timedelta(days=179),
-            end_date
+            end_date,
         )
 
         print(
@@ -518,20 +732,70 @@ def fetch_daily_history(
             f"{current_start} to {current_end}"
         )
 
+        # Space requests apart.
+        _wait_for_request_slot()
+
         try:
 
             response = client.historical_data(
                 neosymbol=neo_symbol,
                 interval="D",
                 from_date=current_start.isoformat(),
-                to_date=current_end.isoformat()
+                to_date=current_end.isoformat(),
             )
 
         except Exception as exc:
+
+            if _is_rate_limit_error(exc):
+
+                retry_after = _get_retry_after_seconds(exc)
+
+                if retry_after is not None:
+                    guidance = (
+                        f"Kotak supplied Retry-After: "
+                        f"{retry_after} seconds."
+                    )
+                else:
+                    guidance = (
+                        "Kotak did not expose a Retry-After value. "
+                        "Wait several minutes before trying again."
+                    )
+
+                raise KotakRateLimitError(
+                    f"Kotak Neo rate limit reached while downloading "
+                    f"{symbol} ({current_start} to {current_end}). "
+                    f"{guidance} No further requests were sent. "
+                    f"Original error: {exc}",
+                    retry_after=retry_after,
+                ) from exc
+
             raise RuntimeError(
-                f"Kotak request failed for {symbol} "
+                f"Kotak historical request failed for {symbol} "
                 f"from {current_start} to {current_end}: {exc}"
             ) from exc
+
+        # Some SDK versions return an error dictionary instead
+        # of raising an exception.
+        if _is_rate_limit_error(response):
+
+            retry_after = _get_retry_after_seconds(response)
+
+            if retry_after is not None:
+                guidance = (
+                    f"Retry-After: {retry_after} seconds."
+                )
+            else:
+                guidance = (
+                    "No Retry-After value was supplied. "
+                    "Wait several minutes before trying again."
+                )
+
+            raise KotakRateLimitError(
+                f"Kotak Neo returned HTTP 429 for {symbol} "
+                f"({current_start} to {current_end}). "
+                f"{guidance} No further requests were sent.",
+                retry_after=retry_after,
+            )
 
         chunk = _parse_candles(response)
 
@@ -541,6 +805,7 @@ def fetch_daily_history(
         current_start = current_end + timedelta(days=1)
 
     if not all_data:
+
         return pd.DataFrame(columns=[
             "date",
             "open",
@@ -552,14 +817,14 @@ def fetch_daily_history(
 
     result = pd.concat(
         all_data,
-        ignore_index=True
+        ignore_index=True,
     )
 
     result = (
         result.sort_values("date")
         .drop_duplicates(
             subset="date",
-            keep="last"
+            keep="last",
         )
         .reset_index(drop=True)
     )
@@ -574,9 +839,9 @@ def fetch_daily_history(
 def save_historical_data(
     price_df,
     symbol,
-    output_dir=None
+    output_dir=None,
 ):
-    """Save downloaded historical data as a CSV file."""
+    """Save historical data locally as a CSV file."""
 
     symbol = str(symbol).strip().upper()
 
@@ -595,7 +860,7 @@ def save_historical_data(
 
     output_dir.mkdir(
         parents=True,
-        exist_ok=True
+        exist_ok=True,
     )
 
     output_file = (
@@ -604,8 +869,7 @@ def save_historical_data(
 
     price_df.to_csv(
         output_file,
-        index=False
+        index=False,
     )
 
     return output_file
-
