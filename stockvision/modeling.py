@@ -163,15 +163,50 @@ def train_one_horizon(
         / working["close"]
     )
 
-    total_rows = len(working)
+ total_rows = len(working)
 
-    if total_rows < 150:
-        raise ValueError(
-            f"Not enough historical data for the {horizon}-day model. "
-            "Collect more daily price history."
-        )
+if total_rows < 150:
+    raise ValueError(
+        f"Not enough historical data for the {horizon}-day model. "
+        "Collect more daily price history."
+    )
 
-    split_position = int(total_rows * (1 - test_size))
+if not 0 < test_size < 0.5:
+    raise ValueError(
+        "test_size must be greater than 0 and less than 0.5."
+    )
+
+if horizon >= total_rows:
+    raise ValueError(
+        f"Not enough observations for a {horizon}-day forecast."
+    )
+
+# Reserve enough observations for both:
+# 1. The future forecast horizon.
+# 2. A chronological validation sample.
+validation_rows = max(
+    20,
+    int(total_rows * test_size)
+)
+
+maximum_validation_rows = total_rows - horizon - 1
+
+validation_rows = min(
+    validation_rows,
+    maximum_validation_rows
+)
+
+if validation_rows < 20:
+    raise ValueError(
+        f"Insufficient historical data for {horizon}-day validation. "
+        "Collect more daily price history."
+    )
+
+# Move the training boundary earlier to account for
+# the future target period.
+split_position = (
+    total_rows - horizon - validation_rows
+)
 
     # Purge training examples whose target reaches into the test period.
     train_mask = (
