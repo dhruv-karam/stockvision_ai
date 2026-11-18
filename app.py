@@ -8,6 +8,7 @@ from stockvision.instruments import update_instruments
 from stockvision.backtesting import walk_forward_backtest
 from stockvision.risk import calculate_risk_metrics
 from stockvision.scanner import scan_watchlist
+from stockvision.fundamentals import analyze_fundamentals
 from stockvision.data import fetch_daily_history
 from stockvision.features import build_features
 from stockvision.modeling import (
@@ -377,7 +378,7 @@ st.divider()
 # --------------------------------------------------
 # DASHBOARD TABS
 # --------------------------------------------------
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
     [
         "📈 Market Analysis",
         "🤖 AI Forecasts",
@@ -387,6 +388,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
         "⭐ Watchlist",
         "⚠️ Risk Analysis",
         "🔍 Stock Scanner",
+        "🏢 Fundamentals",
     ]
 )
 # --------------------------------------------------
@@ -1471,6 +1473,217 @@ with tab8:
         "Kotak Neo. Results are not live streaming prices or "
         "personalised investment recommendations."
     )
+# --------------------------------------------------
+# TAB 9: FUNDAMENTAL ANALYSIS
+# --------------------------------------------------
+
+with tab9:
+
+    st.subheader("🏢 Company Fundamental Analysis")
+
+    st.write(
+        f"Financial health and valuation analysis for {active_symbol}."
+    )
+
+    st.info(
+        "Upload a CSV containing the company's annual financial "
+        "statements. The market price is taken from the currently "
+        "loaded stock data."
+    )
+
+    st.metric(
+        "Current Market Price",
+        f"₹{latest_price:,.2f}",
+    )
+
+    fundamentals_file = st.file_uploader(
+        "Upload annual financial statements CSV",
+        type=["csv"],
+        key="fundamentals_upload",
+    )
+
+    st.caption(
+        "Use consolidated financial statements consistently. "
+        "Enter financial amounts in the same unit, such as INR crore."
+    )
+
+    if fundamentals_file is not None:
+
+        try:
+            financials = pd.read_csv(fundamentals_file)
+
+            st.markdown("#### Uploaded Financial Statements")
+
+            st.dataframe(
+                financials,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            if st.button(
+                "📊 Analyse Company Fundamentals",
+                type="primary",
+                key="analyse_fundamentals",
+            ):
+
+                results = analyze_fundamentals(
+                    financials=financials,
+                    market_price=latest_price,
+                )
+
+                st.session_state.fundamental_results = results
+                st.session_state.fundamental_symbol = active_symbol
+
+                st.success("Fundamental analysis completed!")
+
+        except Exception as error:
+            st.error(
+                f"Fundamental analysis failed: {error}"
+            )
+
+    results = st.session_state.get(
+        "fundamental_results"
+    )
+
+    result_symbol = st.session_state.get(
+        "fundamental_symbol"
+    )
+
+    if results is not None and result_symbol == active_symbol:
+
+        st.divider()
+
+        st.subheader("Financial Health Dashboard")
+
+        col1, col2, col3, col4 = st.columns(4)
+
+        col1.metric(
+            "Fiscal Year",
+            results["latest_fiscal_year"],
+        )
+
+        col2.metric(
+            "EPS",
+            f"₹{results['eps']:,.2f}",
+        )
+
+        pe_value = results["pe_ratio"]
+
+        col3.metric(
+            "P/E Ratio",
+            f"{pe_value:.2f}" if pd.notna(pe_value) else "N/A",
+        )
+
+        col4.metric(
+            "ROE",
+            (
+                f"{results['roe_pct']:.2f}%"
+                if pd.notna(results["roe_pct"])
+                else "N/A"
+            ),
+        )
+
+        st.subheader("Growth Analysis")
+
+        growth_rows = [
+            {
+                "Metric": "Revenue Growth",
+                "Value": results["revenue_growth_pct"],
+            },
+            {
+                "Metric": "Operating Profit Growth",
+                "Value": results["operating_profit_growth_pct"],
+            },
+            {
+                "Metric": "Net Profit Growth",
+                "Value": results["net_profit_growth_pct"],
+            },
+            {
+                "Metric": "EPS Growth",
+                "Value": results["eps_growth_pct"],
+            },
+        ]
+
+        growth_df = pd.DataFrame(growth_rows)
+
+        growth_df["Value"] = growth_df["Value"].apply(
+            lambda x: f"{x:.2f}%" if pd.notna(x) else "N/A"
+        )
+
+        st.dataframe(
+            growth_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.subheader("Profitability Analysis")
+
+        profitability_rows = [
+            {
+                "Metric": "Operating Profit",
+                "Value": f"{results['operating_profit']:,.2f}",
+            },
+            {
+                "Metric": "Net Profit",
+                "Value": f"{results['net_profit']:,.2f}",
+            },
+            {
+                "Metric": "Operating Margin",
+                "Value": f"{results['operating_margin_pct']:.2f}%",
+            },
+            {
+                "Metric": "Net Profit Margin",
+                "Value": f"{results['net_profit_margin_pct']:.2f}%",
+            },
+            {
+                "Metric": "ROCE",
+                "Value": (
+                    f"{results['roce_pct']:.2f}%"
+                    if pd.notna(results["roce_pct"])
+                    else "Not supplied"
+                ),
+            },
+        ]
+
+        st.dataframe(
+            pd.DataFrame(profitability_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.subheader("Balance Sheet Strength")
+
+        balance_rows = [
+            {
+                "Metric": "Debt-to-Equity",
+                "Value": (
+                    f"{results['debt_to_equity']:.2f}"
+                    if pd.notna(results["debt_to_equity"])
+                    else "N/A"
+                ),
+            },
+            {
+                "Metric": "Current Ratio",
+                "Value": (
+                    f"{results['current_ratio']:.2f}"
+                    if pd.notna(results["current_ratio"])
+                    else "N/A"
+                ),
+            },
+        ]
+
+        st.dataframe(
+            pd.DataFrame(balance_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.caption(
+            "All calculations depend on the accuracy of the "
+            "uploaded financial statements. P/E uses the latest "
+            "loaded market price and uploaded EPS. These metrics "
+            "are not automatic investment recommendations."
+        )
 # --------------------------------------------------
 # FOOTER
 # --------------------------------------------------
