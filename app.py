@@ -6,6 +6,7 @@ from stockvision.signals import generate_technical_signal
 from pathlib import Path
 from stockvision.instruments import update_instruments
 from stockvision.backtesting import walk_forward_backtest
+from stockvision.risk import calculate_risk_metrics
 
 from stockvision.data import fetch_daily_history
 from stockvision.features import build_features
@@ -376,7 +377,7 @@ st.divider()
 # --------------------------------------------------
 # DASHBOARD TABS
 # --------------------------------------------------
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
     [
         "📈 Market Analysis",
         "🤖 AI Forecasts",
@@ -384,6 +385,7 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
         "📋 Historical Data",
         "🧪 Backtesting",
         "⭐ Watchlist",
+        "⚠️ Risk Analysis",
     ]
 )
 # --------------------------------------------------
@@ -1160,6 +1162,149 @@ with tab6:
         "Your watchlist is saved locally in data/watchlist.csv. "
         "It is not automatically synchronized across devices."
     )
+# --------------------------------------------------
+# TAB 7: RISK ANALYSIS
+# --------------------------------------------------
+
+with tab7:
+
+    st.subheader("⚠️ Historical Stock Risk Analysis")
+
+    st.write(
+        "Analyse historical volatility, downside risk, "
+        "maximum drawdown and risk-adjusted returns."
+    )
+
+    risk_free_rate = st.number_input(
+        "Annual Risk-Free Rate (%)",
+        min_value=0.0,
+        max_value=30.0,
+        value=6.0,
+        step=0.25,
+    )
+
+    confidence_level = st.selectbox(
+        "VaR Confidence Level",
+        options=[0.90, 0.95, 0.99],
+        index=1,
+        format_func=lambda x: f"{x:.0%}",
+    )
+
+    if st.button(
+        "Calculate Risk Metrics",
+        type="primary",
+    ):
+
+        try:
+            risk_results = calculate_risk_metrics(
+                price_df=price_df,
+                risk_free_rate=risk_free_rate / 100,
+                confidence_level=confidence_level,
+            )
+
+            st.session_state.risk_results = risk_results
+
+        except Exception as error:
+            st.error(
+                f"Risk calculation failed: {error}"
+            )
+
+    risk_results = st.session_state.get(
+        "risk_results"
+    )
+
+    if risk_results is not None:
+
+        st.divider()
+
+        st.subheader("Risk Dashboard")
+
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            st.metric(
+                "Annualized Volatility",
+                f"{risk_results['annualized_volatility_pct']:.2f}%",
+            )
+
+        with col2:
+            st.metric(
+                "Maximum Drawdown",
+                f"{risk_results['maximum_drawdown_pct']:.2f}%",
+            )
+
+        with col3:
+            st.metric(
+                "Annualized Historical Return",
+                f"{risk_results['annualized_return_pct']:+.2f}%",
+            )
+
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            st.metric(
+                "Sharpe Ratio",
+                f"{risk_results['sharpe_ratio']:.3f}",
+            )
+
+        with col2:
+            st.metric(
+                "Sortino Ratio",
+                f"{risk_results['sortino_ratio']:.3f}",
+            )
+
+        with col3:
+            st.metric(
+                "Daily VaR",
+                f"{risk_results['daily_var_pct']:.2f}%",
+            )
+
+        st.subheader("Additional Risk Measurements")
+
+        risk_table = pd.DataFrame([
+            {
+                "Metric": "Daily Conditional VaR",
+                "Value": (
+                    f"{risk_results['daily_cvar_pct']:.2f}%"
+                ),
+            },
+            {
+                "Metric": "VaR Confidence Level",
+                "Value": (
+                    f"{risk_results['confidence_level_pct']:.0f}%"
+                ),
+            },
+            {
+                "Metric": "Observations",
+                "Value": str(risk_results["observations"]),
+            },
+            {
+                "Metric": "Annual Risk-Free Rate",
+                "Value": (
+                    f"{risk_results['risk_free_rate_pct']:.2f}%"
+                ),
+            },
+        ])
+
+        st.dataframe(
+            risk_table,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.caption(
+            "VaR and Conditional VaR are historical estimates "
+            "based on daily returns. They do not guarantee a "
+            "maximum future loss. Ratios and returns are "
+            "sensitive to the selected historical period."
+        )
+
+    else:
+
+        st.info(
+            "Click Calculate Risk Metrics to analyse "
+            "the selected stock's historical risk."
+        )
 # --------------------------------------------------
 # FOOTER
 # --------------------------------------------------
