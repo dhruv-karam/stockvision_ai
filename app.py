@@ -7,7 +7,7 @@ from pathlib import Path
 from stockvision.instruments import update_instruments
 from stockvision.backtesting import walk_forward_backtest
 from stockvision.risk import calculate_risk_metrics
-
+from stockvision.scanner import scan_watchlist
 from stockvision.data import fetch_daily_history
 from stockvision.features import build_features
 from stockvision.modeling import (
@@ -386,6 +386,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
         "🧪 Backtesting",
         "⭐ Watchlist",
         "⚠️ Risk Analysis",
+        "🔍 Stock Scanner",
     ]
 )
 # --------------------------------------------------
@@ -1305,6 +1306,171 @@ with tab7:
             "Click Calculate Risk Metrics to analyse "
             "the selected stock's historical risk."
         )
+# --------------------------------------------------
+# TAB 8: MULTI-STOCK SCANNER
+# --------------------------------------------------
+
+with tab8:
+
+    st.subheader("🔍 Multi-Stock Watchlist Scanner")
+
+    st.write(
+        "Scan your saved NSE watchlist for technical signals, "
+        "price movements and historical risk."
+    )
+
+    watchlist_df = load_watchlist()
+
+    if watchlist_df.empty:
+
+        st.info(
+            "Your watchlist is empty. Add stocks in the "
+            "Watchlist tab before running a scan."
+        )
+
+    else:
+
+        st.metric(
+            "Stocks Available to Scan",
+            len(watchlist_df),
+        )
+
+        lookback_days = st.selectbox(
+            "Historical data period",
+            options=[500, 750, 1000, 1500],
+            index=2,
+            format_func=lambda x: f"{x} calendar days",
+        )
+
+        run_scanner = st.button(
+            "🚀 Scan All Watchlist Stocks",
+            type="primary",
+        )
+
+        if run_scanner:
+
+            try:
+                with st.spinner(
+                    "Fetching historical data and analysing stocks..."
+                ):
+
+                    scanner_results = scan_watchlist(
+                        watchlist_df=watchlist_df,
+                        lookback_days=lookback_days,
+                    )
+
+                    st.session_state.scanner_results = (
+                        scanner_results
+                    )
+
+                st.success("Watchlist scan completed!")
+
+            except Exception as error:
+                st.error(
+                    f"Scanner failed: {error}"
+                )
+
+        scanner_results = st.session_state.get(
+            "scanner_results"
+        )
+
+        if scanner_results is not None:
+
+            st.divider()
+
+            st.subheader("Stock Scanner Results")
+
+            successful = scanner_results[
+                scanner_results["status"] == "Success"
+            ]
+
+            failed = scanner_results[
+                scanner_results["status"] == "Failed"
+            ]
+
+            col1, col2 = st.columns(2)
+
+            col1.metric(
+                "Successfully Analysed",
+                len(successful),
+            )
+
+            col2.metric(
+                "Failed",
+                len(failed),
+            )
+
+            if not successful.empty:
+
+                display_columns = [
+                    "symbol",
+                    "latest_price",
+                    "daily_change_pct",
+                    "rsi",
+                    "technical_score",
+                    "technical_bias",
+                    "annualized_volatility_pct",
+                    "maximum_drawdown_pct",
+                ]
+
+                st.dataframe(
+                    successful[display_columns].style.format({
+                        "latest_price": "₹{:,.2f}",
+                        "daily_change_pct": "{:+.2f}%",
+                        "rsi": "{:.2f}",
+                        "technical_score": "{:+.1f}",
+                        "annualized_volatility_pct": "{:.2f}%",
+                        "maximum_drawdown_pct": "{:.2f}%",
+                    }),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                scanner_chart = px.bar(
+                    successful,
+                    x="symbol",
+                    y="technical_score",
+                    color="technical_bias",
+                    title="Technical Scores Across Your Watchlist",
+                    labels={
+                        "symbol": "Stock",
+                        "technical_score": "Technical Score",
+                    },
+                )
+
+                st.plotly_chart(
+                    scanner_chart,
+                    use_container_width=True,
+                )
+
+                csv_data = successful.to_csv(
+                    index=False
+                ).encode("utf-8")
+
+                st.download_button(
+                    "⬇️ Download Scanner Results",
+                    data=csv_data,
+                    file_name="stockvision_scanner_results.csv",
+                    mime="text/csv",
+                )
+
+            if not failed.empty:
+
+                st.subheader("Stocks Requiring Attention")
+
+                st.dataframe(
+                    failed[
+                        ["symbol", "error"]
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+    st.caption(
+        "The scanner uses historical daily data retrieved from "
+        "Kotak Neo. Results are not live streaming prices or "
+        "personalised investment recommendations."
+    )
 # --------------------------------------------------
 # FOOTER
 # --------------------------------------------------
